@@ -1,7 +1,7 @@
 {
-  "name": "MetabolicSuite",
-  "short_name": "MetabolicSuite",
-  "description": "Interactive metabolic pathway visualization with multi-omics integration",
+  "name": "MetaboViz",
+  "short_name": "MetaboViz",
+  "description": "Browser-native genome-scale metabolic model visualizer with FBA, pathway maps, and gene knockout simulation",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#ffffff",
