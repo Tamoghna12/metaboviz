@@ -306,8 +306,8 @@ class ComputeManager {
         console.warn('pFBA not available on main thread, using standard FBA');
         return solveFBA(model, solverOptions);
       case 'moma':
-        // MOMA requires QP - fallback to standard FBA
-        console.warn('MOMA not available on main thread, using standard FBA');
+        // Linear MOMA uses LP (L1 norm), but still requires two-phase solving
+        console.warn('MOMA not available on main thread, using standard FBA as fallback');
         return solveFBA(model, solverOptions);
       default:
         throw new Error(`Method ${method} not available on main thread`);
@@ -374,10 +374,10 @@ registerAlgorithm('fva', {
 });
 
 registerAlgorithm('moma', {
-  name: 'Minimization of Metabolic Adjustment',
+  name: 'Linear MOMA (Minimization of Metabolic Adjustment)',
   type: 'hybrid',
   requiresMILP: false,
-  reference: 'Segre et al. (2002) PNAS',
+  reference: 'Segrè et al. (2002) PNAS; Becker et al. (2007) BMC Syst Biol (L1 linearization)',
 });
 
 registerAlgorithm('gimme', {

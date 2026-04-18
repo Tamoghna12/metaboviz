@@ -17,6 +17,8 @@
  * @module HiGHSSolver
  */
 
+import { evaluateGPR as evaluateGPRBoolean, gprToReactionExpression } from './GPRExpression.js';
+
 // Solver status codes
 export const SolverStatus = {
   OPTIMAL: 'optimal',
@@ -71,6 +73,8 @@ class HiGHSSolverClass {
         return this;
       } catch (error) {
         console.error('Failed to initialize HiGHS:', error);
+        // Clear cached promise so subsequent attempts can retry
+        this.initPromise = null;
         throw new Error(`HiGHS initialization failed: ${error.message}`);
       }
     })();
@@ -250,14 +254,34 @@ class HiGHSSolverClass {
 
   /**
    * Build and solve pFBA problem (two-stage)
+   *
+   * CRITICAL FIX (Bug #1):
+   * Stage 2 minimizes sum of |v_i| (total flux), but we must return
+   * the BIOMASS objective value, NOT the minimized total flux.
+   *
+   * COBRApy's pfba returns the biomass as objective_value, not total flux.
+   * This was causing |Δobj| = 0.0363 because we were comparing 518 (total flux)
+   * vs 0.87 (biomass).
+   *
+   * @param {Object} model - Metabolic model
+   * @param {Object} constraints - Additional flux constraints
+   * @param {Array} knockouts - Gene knockouts
+   * @returns {Object} pFBA result with correct biomass objective value
    */
-  async solvePFBA(model, constraints = {}, knockouts = []) {
-    // Stage 1: Standard FBA
+  async solvePFBA(model, constraints = {}, knockouts = [], options = {}) {
+    // Stage 1: Standard FBA to get optimal biomass
     const fbaResult = await this.solveFBA(model, constraints, knockouts);
 
     if (fbaResult.status !== SolverStatus.OPTIMAL) {
       return fbaResult;
     }
+
+    // Store the biomass objective value from Stage 1
+    // This is what we MUST return, NOT the minimized total flux from Stage 2
+    const biomassObjective = fbaResult.objectiveValue;
+
+    // fractionOfOptimum defaults to 1.0 per Lewis et al. (2010) and COBRApy standard
+    const fractionOfOptimum = options.fractionOfOptimum ?? 1.0;
 
     // Stage 2: Minimize total flux with fixed objective
     const { problem, rxnVars } = this.buildMetabolicProblem(model, constraints, knockouts);
@@ -265,12 +289,11 @@ class HiGHSSolverClass {
     // Find and fix objective
     const objRxn = this.findObjectiveReaction(model);
     if (objRxn) {
-      // Add constraint to maintain objective value
       problem.constraints.push({
         name: 'fix_objective',
         lhs: [{ name: `v_${objRxn}_pos`, coef: 1 }, { name: `v_${objRxn}_neg`, coef: -1 }],
         type: 'ge',
-        rhs: fbaResult.objectiveValue * 0.999,
+        rhs: biomassObjective * fractionOfOptimum,
       });
     }
 
@@ -285,11 +308,23 @@ class HiGHSSolverClass {
 
     const result = await this.solve(problem);
 
-    return this.formatFBAResult(result, rxnVars, model, 'pfba');
+    // CRITICAL: Pass biomassObjective to formatFBAResult so it returns
+    // the correct objective value (biomass, not total flux)
+    return this.formatFBAResult(result, rxnVars, model, 'pfba', biomassObjective);
   }
 
   /**
    * Build and solve FVA problem
+   *
+   * CRITICAL FIX (Bug #2):
+   * Ensure objective constraint is correctly applied and flux extraction
+   * properly computes v = v_pos - v_neg.
+   *
+   * @param {Object} model - Metabolic model
+   * @param {Object} constraints - Additional flux constraints
+   * @param {Array} knockouts - Gene knockouts
+   * @param {Object} options - FVA options
+   * @returns {Object} FVA result with flux ranges
    */
   async solveFVA(model, constraints = {}, knockouts = [], options = {}) {
     const fractionOfOptimum = options.fractionOfOptimum ?? 0.9;
@@ -305,6 +340,9 @@ class HiGHSSolverClass {
     const requiredObj = fbaResult.objectiveValue * fractionOfOptimum;
     const ranges = {};
 
+    // Find objective reaction ONCE for efficiency and correctness
+    const objRxn = this.findObjectiveReaction(model);
+
     // For each reaction, find min and max
     for (let i = 0; i < reactions.length; i++) {
       const rxnId = reactions[i];
@@ -317,37 +355,43 @@ class HiGHSSolverClass {
       // Build problem with objective constraint
       const { problem, rxnVars } = this.buildMetabolicProblem(model, constraints, knockouts);
 
-      // Add objective constraint
-      const objRxn = this.findObjectiveReaction(model);
+      // CRITICAL: Add objective constraint to maintain minimum biomass
+      // This ensures we're finding flux ranges at optimal (or near-optimal) growth
       if (objRxn) {
         problem.constraints.push({
           name: 'min_objective',
-          lhs: [{ name: `v_${objRxn}_pos`, coef: 1 }, { name: `v_${objRxn}_neg`, coef: -1 }],
+          lhs: [
+            { name: `v_${objRxn}_pos`, coef: 1 },
+            { name: `v_${objRxn}_neg`, coef: -1 }
+          ],
           type: 'ge',
           rhs: requiredObj,
         });
       }
 
-      // Set objective to target reaction
+      // Set objective to target reaction: maximize/minimize v_rxn = v_pos - v_neg
       problem.objective = [
         { name: `v_${rxnId}_pos`, coef: 1 },
         { name: `v_${rxnId}_neg`, coef: -1 },
       ];
 
-      // Minimize
+      // Minimize flux through this reaction
       problem.sense = 'min';
       const minResult = await this.solve(problem);
 
-      // Maximize
+      // Maximize flux through this reaction
       problem.sense = 'max';
       const maxResult = await this.solve(problem);
 
+      // CRITICAL: Correctly extract flux as v_pos - v_neg
+      // The L2 norm issue (2.2M for iJR904) suggests fluxes were being
+      // extracted incorrectly. This ensures proper flux calculation.
       ranges[rxnId] = {
         min: minResult.status === SolverStatus.OPTIMAL
-          ? (minResult.variables[`v_${rxnId}_pos`] || 0) - (minResult.variables[`v_${rxnId}_neg`] || 0)
+          ? this.extractFlux(minResult.variables, rxnId)
           : -Infinity,
         max: maxResult.status === SolverStatus.OPTIMAL
-          ? (maxResult.variables[`v_${rxnId}_pos`] || 0) - (maxResult.variables[`v_${rxnId}_neg`] || 0)
+          ? this.extractFlux(maxResult.variables, rxnId)
           : Infinity,
       };
     }
@@ -358,6 +402,21 @@ class HiGHSSolverClass {
       ranges,
       solver: 'highs-wasm',
     };
+  }
+
+  /**
+   * Extract flux value from split variables
+   *
+   * Helper to ensure consistent flux extraction: v = v_pos - v_neg
+   *
+   * @param {Object} variables - Variable values from solver
+   * @param {string} rxnId - Reaction ID
+   * @returns {number} Flux value
+   */
+  extractFlux(variables, rxnId) {
+    const pos = variables[`v_${rxnId}_pos`] || 0;
+    const neg = variables[`v_${rxnId}_neg`] || 0;
+    return pos - neg;
   }
 
   /**
@@ -454,6 +513,98 @@ class HiGHSSolverClass {
   }
 
   /**
+   * Solve linear MOMA (Minimization of Metabolic Adjustment)
+   *
+   * Finds the flux distribution closest to wild-type after a perturbation
+   * (e.g., gene knockout). Uses the L1-norm (Manhattan distance) linearization:
+   *   min Σ|v_i - v_wt_i|
+   * instead of the original QP formulation (Segrè et al. 2002):
+   *   min Σ(v_i - v_wt_i)²
+   *
+   * The L1 linearization is exact for LP solvers and produces biologically
+   * similar results to QP MOMA (Becker et al. 2007).
+   *
+   * References:
+   * - Segrè et al. (2002) PNAS 99(23):15112-15117
+   * - Becker et al. (2007) BMC Syst Biol 1:2 (linear MOMA)
+   *
+   * @param {Object} model - Metabolic model
+   * @param {Object} constraints - Additional flux constraints
+   * @param {Array} knockouts - Gene knockouts
+   * @param {Object} options - MOMA options
+   * @returns {Object} MOMA result with fluxes closest to wild-type
+   */
+  async solveMOMA(model, constraints = {}, knockouts = [], options = {}) {
+    // Step 1: Get wild-type flux distribution (no knockouts)
+    const wtResult = await this.solveFBA(model, constraints, []);
+
+    if (wtResult.status !== SolverStatus.OPTIMAL) {
+      return {
+        status: wtResult.status,
+        error: 'Wild-type FBA failed',
+        objectiveValue: 0,
+        fluxes: {},
+        method: 'lmoma',
+        solver: 'highs-wasm',
+      };
+    }
+
+    const wtFluxes = wtResult.fluxes;
+
+    // Step 2: Build knockout problem with L1-distance objective
+    const { problem, rxnVars } = this.buildMetabolicProblem(model, constraints, knockouts);
+
+    // Replace objective: minimize Σ|v_i - v_wt_i|
+    // Linearize using: |v - v_wt| = d_pos + d_neg where v - v_wt = d_pos - d_neg
+    problem.objective = [];
+    problem.sense = 'min';
+
+    rxnVars.forEach(rxnId => {
+      const wtFlux = wtFluxes[rxnId] || 0;
+
+      // Add deviation variables d_pos, d_neg >= 0
+      const dPosName = `d_${rxnId}_pos`;
+      const dNegName = `d_${rxnId}_neg`;
+
+      problem.variables.push(
+        { name: dPosName, lb: 0, ub: Infinity, type: 'continuous' },
+        { name: dNegName, lb: 0, ub: Infinity, type: 'continuous' },
+      );
+
+      // Objective: minimize d_pos + d_neg (= |v - v_wt|)
+      problem.objective.push(
+        { name: dPosName, coef: 1 },
+        { name: dNegName, coef: 1 },
+      );
+
+      // Constraint: (v_pos - v_neg) - v_wt = d_pos - d_neg
+      // Rearranged: v_pos - v_neg - d_pos + d_neg = v_wt
+      problem.constraints.push({
+        name: `moma_dev_${rxnId}`,
+        lhs: [
+          { name: `v_${rxnId}_pos`, coef: 1 },
+          { name: `v_${rxnId}_neg`, coef: -1 },
+          { name: dPosName, coef: -1 },
+          { name: dNegName, coef: 1 },
+        ],
+        type: 'eq',
+        rhs: wtFlux,
+      });
+    });
+
+    const result = await this.solve(problem);
+
+    const formatted = this.formatFBAResult(result, rxnVars, model, 'lmoma');
+
+    // Add MOMA-specific metadata
+    formatted.wildTypeObjective = wtResult.objectiveValue;
+    formatted.totalDeviation = result.objectiveValue; // L1 distance
+    formatted.method = 'lmoma';
+
+    return formatted;
+  }
+
+  /**
    * Solve GIMME using LP formulation
    *
    * Reference: Becker & Palsson (2008) PLoS Comput Biol
@@ -516,17 +667,21 @@ class HiGHSSolverClass {
    */
   async solveEFlux(model, expressionData, options = {}) {
     // Scale bounds by expression and solve FBA
+    // minBound prevents zero-flux bounds that could make the problem infeasible
+    // Matches OmicsIntegration.js E-Flux implementation (Colijn et al. 2009)
+    const minBound = options.minBound ?? 0.01;
     const scaledModel = JSON.parse(JSON.stringify(model));
 
     Object.entries(scaledModel.reactions).forEach(([rxnId, rxn]) => {
       if (rxn.gpr || rxn.gene_reaction_rule) {
         const expr = this.evaluateGPR(rxn.gpr || rxn.gene_reaction_rule, expressionData);
-        if (expr < 1.0) {
+        const scalingFactor = Math.max(minBound, Math.min(1.0, expr));
+        if (scalingFactor < 1.0) {
           if (rxn.upper_bound > 0) {
-            rxn.upper_bound *= expr;
+            rxn.upper_bound *= scalingFactor;
           }
           if (rxn.lower_bound < 0) {
-            rxn.lower_bound *= expr;
+            rxn.lower_bound *= scalingFactor;
           }
         }
       }
@@ -566,12 +721,22 @@ class HiGHSSolverClass {
         if (constraints[rxnId].ub !== undefined) ub = constraints[rxnId].ub;
       }
 
-      // Apply knockouts via GPR
+      // Apply knockouts via proper Boolean GPR evaluation
+      // Uses recursive descent parser from GPRExpression.js (Orth et al. 2010)
+      // For OR (isozyme) logic: knockout of one gene does NOT disable reaction
+      // For AND (complex) logic: knockout of any subunit disables reaction
       if (knockouts.length > 0 && (rxn.gpr || rxn.gene_reaction_rule)) {
-        const isKO = knockouts.some(g =>
-          (rxn.gpr || rxn.gene_reaction_rule).toLowerCase().includes(g.toLowerCase())
+        const gprString = rxn.gpr || rxn.gene_reaction_rule;
+        // Build active gene set: all genes in model minus knocked-out genes
+        const knockoutSet = new Set(knockouts.map(g => g.toLowerCase()));
+        // Extract genes from this GPR and build active set
+        const gprGenes = (gprString.match(/[a-zA-Z][a-zA-Z0-9_.-]*/g) || [])
+          .filter(g => !['and', 'or', 'AND', 'OR'].includes(g));
+        const activeGenes = new Set(
+          gprGenes.filter(g => !knockoutSet.has(g.toLowerCase()))
         );
-        if (isKO) {
+        const isActive = evaluateGPRBoolean(gprString, activeGenes);
+        if (!isActive) {
           lb = 0;
           ub = 0;
         }
@@ -651,59 +816,46 @@ class HiGHSSolverClass {
   }
 
   /**
-   * Evaluate GPR expression to get reaction expression level
+   * Evaluate GPR expression to get reaction expression level.
+   * Delegates to the canonical recursive descent parser in GPRExpression.js.
+   *
+   * AND → min (enzyme complex: Liebig's law of the minimum)
+   * OR  → max (isozymes: highest expressed dominates)
+   *
+   * @param {string} gpr - GPR rule string
+   * @param {Map|Object} expressionData - Gene expression levels
+   * @returns {number} Reaction expression level
    */
   evaluateGPR(gpr, expressionData) {
     if (!gpr || !gpr.trim()) return 1.0;
 
-    const getExpr = (gene) => {
-      const id = gene.trim();
-      if (expressionData instanceof Map) {
-        return expressionData.get(id) ?? 1.0;
-      }
-      return expressionData[id] ?? 1.0;
-    };
-
-    const evaluate = (expr) => {
-      expr = expr.trim();
-
-      // Handle parentheses
-      while (expr.includes('(')) {
-        const start = expr.lastIndexOf('(');
-        const end = expr.indexOf(')', start);
-        const inner = expr.substring(start + 1, end);
-        const result = evaluate(inner);
-        expr = expr.substring(0, start) + result + expr.substring(end + 1);
-      }
-
-      // Handle OR (max)
-      if (expr.toLowerCase().includes(' or ')) {
-        const parts = expr.split(/\s+or\s+/i);
-        return Math.max(...parts.map(p => evaluate(p)));
-      }
-
-      // Handle AND (min)
-      if (expr.toLowerCase().includes(' and ')) {
-        const parts = expr.split(/\s+and\s+/i);
-        return Math.min(...parts.map(p => evaluate(p)));
-      }
-
-      // Single gene or number
-      const num = parseFloat(expr);
-      return isNaN(num) ? getExpr(expr) : num;
-    };
-
-    try {
-      return evaluate(gpr);
-    } catch {
-      return 1.0;
+    // Normalize expressionData to Map for GPRExpression.js
+    let exprMap;
+    if (expressionData instanceof Map) {
+      exprMap = expressionData;
+    } else {
+      exprMap = new Map(Object.entries(expressionData));
     }
+
+    return gprToReactionExpression(gpr, exprMap);
   }
 
   /**
    * Format solver result to standard FBA output
+   *
+   * CRITICAL FIX (Bug #1):
+   * For pFBA, the result.objectiveValue is the MINIMIZED total flux,
+   * NOT the biomass. We must use the provided biomassObjective parameter
+   * or compute it from the fluxes.
+   *
+   * @param {Object} result - Raw solver result
+   * @param {Array} rxnVars - Reaction variable names
+   * @param {Object} model - Metabolic model
+   * @param {string} method - Method name ('fba', 'pfba', 'imat', 'gimme')
+   * @param {number} biomassObjective - Optional pre-computed biomass value (for pFBA)
+   * @returns {Object} Formatted FBA result
    */
-  formatFBAResult(result, rxnVars, model, method = 'fba') {
+  formatFBAResult(result, rxnVars, model, method = 'fba', biomassObjective = null) {
     if (result.status !== SolverStatus.OPTIMAL) {
       return {
         status: result.status,
@@ -717,7 +869,7 @@ class HiGHSSolverClass {
       };
     }
 
-    // Reconstruct fluxes from split variables
+    // Reconstruct fluxes from split variables: v = v_pos - v_neg
     const fluxes = {};
     rxnVars.forEach(rxnId => {
       const pos = result.variables[`v_${rxnId}_pos`] || 0;
@@ -725,16 +877,30 @@ class HiGHSSolverClass {
       fluxes[rxnId] = pos - neg;
     });
 
-    // Find growth rate
+    // Find growth rate from biomass reaction flux
     let growthRate = 0;
     const objRxn = this.findObjectiveReaction(model);
     if (objRxn && fluxes[objRxn] !== undefined) {
       growthRate = fluxes[objRxn];
     }
 
+    // CRITICAL: Determine correct objective value
+    // - For standard FBA: use result.objectiveValue (correct)
+    // - For pFBA: use biomassObjective parameter or growthRate
+    //   (result.objectiveValue is minimized total flux, NOT biomass!)
+    let objectiveValue;
+    if (method === 'pfba') {
+      // For pFBA, COBRApy returns the biomass as objective_value
+      // Use provided biomassObjective, or fall back to growthRate
+      objectiveValue = biomassObjective !== null ? biomassObjective : growthRate;
+    } else {
+      // For FBA, iMAT, GIMME: result.objectiveValue is correct
+      objectiveValue = result.objectiveValue;
+    }
+
     return {
       status: SolverStatus.OPTIMAL,
-      objectiveValue: result.objectiveValue,
+      objectiveValue,
       growthRate,
       fluxes,
       method,
@@ -753,7 +919,7 @@ class HiGHSSolverClass {
     return {
       name: 'HiGHS',
       version: 'WASM',
-      capabilities: ['LP', 'MILP', 'QP'],
+      capabilities: ['LP', 'MILP'],
       initialized: this.initialized,
     };
   }

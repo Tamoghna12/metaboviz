@@ -17,6 +17,10 @@
  */
 
 import GLPK from 'glpk.js';
+import { evaluateGPR } from './GPRExpression.js';
+
+// Re-export all GPR functions from GPRExpression.js for backward compatibility
+export { evaluateGPR, extractGenesFromGPR as extractGenes } from './GPRExpression.js';
 
 // Initialize GLPK (returns a promise)
 let glpkInstance = null;
@@ -27,138 +31,7 @@ const getGLPK = async () => {
   return glpkInstance;
 };
 
-/**
- * GPR (Gene-Protein-Reaction) Boolean Parser
- *
- * Parses and evaluates Boolean expressions like:
- * - "b1241 and b1849"
- * - "(b1241 and b1849) or b2925"
- * - "b0720 or b0721 or b0722"
- *
- * @param {string} gprString - The GPR rule string
- * @param {Set<string>} activeGenes - Set of active (non-knocked-out) genes
- * @returns {boolean} - Whether the reaction is active
- */
-export function evaluateGPR(gprString, activeGenes) {
-  if (!gprString || gprString.trim() === '') return true;
-
-  // Tokenize the GPR string
-  const tokens = tokenizeGPR(gprString);
-
-  // Parse and evaluate
-  try {
-    const ast = parseGPRTokens(tokens);
-    return evaluateGPRAst(ast, activeGenes);
-  } catch (e) {
-    console.warn('GPR parsing failed for:', gprString, e);
-    return true; // Default to active if parsing fails
-  }
-}
-
-/**
- * Tokenize GPR string into tokens
- */
-function tokenizeGPR(gprString) {
-  const tokens = [];
-  let current = '';
-
-  for (let i = 0; i < gprString.length; i++) {
-    const char = gprString[i];
-
-    if (char === '(' || char === ')') {
-      if (current.trim()) tokens.push(current.trim());
-      tokens.push(char);
-      current = '';
-    } else if (char === ' ') {
-      if (current.trim()) {
-        const word = current.trim().toLowerCase();
-        if (word === 'and' || word === 'or') {
-          tokens.push(word.toUpperCase());
-        } else {
-          tokens.push(current.trim());
-        }
-      }
-      current = '';
-    } else {
-      current += char;
-    }
-  }
-
-  if (current.trim()) {
-    const word = current.trim().toLowerCase();
-    if (word === 'and' || word === 'or') {
-      tokens.push(word.toUpperCase());
-    } else {
-      tokens.push(current.trim());
-    }
-  }
-
-  return tokens;
-}
-
-/**
- * Parse GPR tokens into AST
- */
-function parseGPRTokens(tokens) {
-  let pos = 0;
-
-  function parseExpression() {
-    let left = parseTerm();
-
-    while (pos < tokens.length && tokens[pos] === 'OR') {
-      pos++; // consume OR
-      const right = parseTerm();
-      left = { type: 'OR', left, right };
-    }
-
-    return left;
-  }
-
-  function parseTerm() {
-    let left = parseFactor();
-
-    while (pos < tokens.length && tokens[pos] === 'AND') {
-      pos++; // consume AND
-      const right = parseFactor();
-      left = { type: 'AND', left, right };
-    }
-
-    return left;
-  }
-
-  function parseFactor() {
-    if (tokens[pos] === '(') {
-      pos++; // consume (
-      const expr = parseExpression();
-      if (tokens[pos] === ')') pos++; // consume )
-      return expr;
-    }
-
-    // Gene identifier
-    const gene = tokens[pos++];
-    return { type: 'GENE', id: gene };
-  }
-
-  return parseExpression();
-}
-
-/**
- * Evaluate GPR AST
- */
-function evaluateGPRAst(ast, activeGenes) {
-  if (!ast) return true;
-
-  switch (ast.type) {
-    case 'GENE':
-      return activeGenes.has(ast.id);
-    case 'AND':
-      return evaluateGPRAst(ast.left, activeGenes) && evaluateGPRAst(ast.right, activeGenes);
-    case 'OR':
-      return evaluateGPRAst(ast.left, activeGenes) || evaluateGPRAst(ast.right, activeGenes);
-    default:
-      return true;
-  }
-}
+// GPR functions are now in GPRExpression.js and re-exported above
 
 /**
  * Extract all genes from a model
@@ -278,7 +151,14 @@ export async function solveFBA(model, options = {}) {
     let lb = rxn.lower_bound ?? -1000;
     let ub = rxn.upper_bound ?? 1000;
 
-    // Check if reaction is active based on GPR
+    // Apply additional constraints first
+    if (constraints[rxnId]) {
+      if (constraints[rxnId].lb !== undefined) lb = constraints[rxnId].lb;
+      if (constraints[rxnId].ub !== undefined) ub = constraints[rxnId].ub;
+    }
+
+    // Apply knockouts AFTER constraints (knockouts are definitive biological
+    // events that override any user-supplied bound constraints)
     if (rxn.gpr || rxn.gene_reaction_rule) {
       const gprString = rxn.gpr || rxn.gene_reaction_rule;
       const isActive = evaluateGPR(gprString, activeGenes);
@@ -286,12 +166,6 @@ export async function solveFBA(model, options = {}) {
         lb = 0;
         ub = 0;
       }
-    }
-
-    // Apply additional constraints
-    if (constraints[rxnId]) {
-      if (constraints[rxnId].lb !== undefined) lb = Math.max(lb, constraints[rxnId].lb);
-      if (constraints[rxnId].ub !== undefined) ub = Math.min(ub, constraints[rxnId].ub);
     }
 
     // Add to objective if this is the objective reaction
@@ -394,7 +268,15 @@ export async function solveFBA(model, options = {}) {
 function findObjectiveReaction(model) {
   const reactions = Object.keys(model.reactions || {});
 
-  // Look for common biomass reaction patterns
+  // Priority 1: Check for explicit objective_coefficient (from FBC package)
+  for (const rxnId of reactions) {
+    const rxn = model.reactions[rxnId];
+    if (rxn.objective_coefficient && rxn.objective_coefficient !== 0) {
+      return rxnId;
+    }
+  }
+
+  // Priority 2: Look for common biomass reaction patterns
   const biomassPatterns = [
     /biomass/i,
     /growth/i,
@@ -414,8 +296,10 @@ function findObjectiveReaction(model) {
     }
   }
 
-  // If no biomass found, return first reaction as fallback
-  return reactions[0] || null;
+  // No objective found — return null instead of arbitrary first reaction
+  // Caller must handle null (Orth et al. 2010: objective must be explicit)
+  console.warn('No objective reaction found. Specify one explicitly.');
+  return null;
 }
 
 /**

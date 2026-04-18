@@ -8,13 +8,11 @@
  * - Stoichiometric matrix construction
  * - Gene extraction
  *
- * Integration tests (require browser/WASM):
- * - FBA optimization with GLPK.js
+ * Integration tests: Now in HiGHSSolver.test.js using HiGHS WASM solver
+ * - FBA optimization
  * - FVA analysis
  * - Gene essentiality
- *
- * Note: GLPK.js uses Web Workers which aren't available in Node.js.
- * The LP solving tests are skipped in Node.js environment.
+ * - pFBA validation
  *
  * Reference model: Simple 3-reaction linear pathway
  * A -> B -> C -> Biomass
@@ -257,30 +255,16 @@ describe('Stoichiometric Matrix', () => {
 });
 
 /**
- * The following tests require GLPK.js which uses Web Workers.
- * They are designed to run in a browser environment or with proper WASM/Worker polyfills.
- *
- * To run these tests:
- * 1. Use Playwright or Puppeteer for browser-based testing
- * 2. Or use the application in the browser and check the console for validation
- *
- * For now, these are documented as integration test specifications.
+ * FBA Integration Tests
+ * These tests have been moved to HiGHSSolver.test.js for proper WASM-based testing.
+ * See HiGHSSolver.test.js for:
+ * - FBA solving with HiGHS WASM
+ * - pFBA validation (fixed bug - now returns biomass objective)
+ * - FVA validation (fixed bug - correct flux extraction)
+ * - Gene knockout tests
  */
 
-describe('FBA Integration Tests (Browser Only)', () => {
-  it.skip('should solve simple linear pathway - requires GLPK', () => {
-    // Test: solveFBA returns OPTIMAL status with positive objective
-  });
-
-  it.skip('should handle gene knockouts via GPR - requires GLPK', () => {
-    // Test: Knocking out essential gene results in zero growth
-  });
-
-  it.skip('should perform FVA correctly - requires GLPK', () => {
-    // Test: FVA returns valid min/max ranges for all reactions
-  });
-});
-
+// GPR tests remain here as they don't require the solver
 describe('GPR-Based Reaction Activity', () => {
   it('should determine reaction activity from GPR and gene set', () => {
     // Test GPR evaluation for reaction activity determination

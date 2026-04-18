@@ -20,6 +20,8 @@
  * @module SolverWorker
  */
 
+import { evaluateGPR as evaluateGPRBoolean, gprToReactionExpression, extractGenesFromGPR } from './GPRExpression.js';
+
 /* =============================================================================
  * NUMERICAL TOLERANCE CONSTANTS
  *
@@ -208,10 +210,20 @@ function buildMetabolicProblem(model, constraints = {}, knockouts = []) {
       if (constraints[rxnId].ub !== undefined) ub = constraints[rxnId].ub;
     }
 
-    // Apply knockouts
+    // Apply knockouts via proper Boolean GPR evaluation
+    // Uses recursive descent parser from GPRExpression.js (Orth et al. 2010)
+    // For OR (isozyme) logic: knockout of one gene does NOT disable reaction
+    // For AND (complex) logic: knockout of any subunit disables reaction
     if (knockouts.length > 0 && (rxn.gpr || rxn.gene_reaction_rule)) {
-      const gpr = (rxn.gpr || rxn.gene_reaction_rule).toLowerCase();
-      if (knockouts.some(g => gpr.includes(g.toLowerCase()))) {
+      const gprString = rxn.gpr || rxn.gene_reaction_rule;
+      const knockoutSet = new Set(knockouts.map(g => g.toLowerCase()));
+      // Extract genes from GPR and build active gene set (all minus knocked-out)
+      const gprGenes = extractGenesFromGPR(gprString);
+      const activeGenes = new Set(
+        gprGenes.filter(g => !knockoutSet.has(g.toLowerCase()))
+      );
+      const isActive = evaluateGPRBoolean(gprString, activeGenes);
+      if (!isActive) {
         lb = 0;
         ub = 0;
       }
@@ -286,43 +298,28 @@ function findObjectiveReaction(model) {
 }
 
 /**
- * Evaluate GPR expression
+ * Evaluate GPR expression to get reaction expression level.
+ * Delegates to the canonical recursive descent parser in GPRExpression.js.
+ *
+ * AND → min (enzyme complex: Liebig's law of the minimum)
+ * OR  → max (isozymes: highest expressed dominates)
+ *
+ * @param {string} gpr - GPR rule string
+ * @param {Map|Object} expressionData - Gene expression levels
+ * @returns {number} Reaction expression level
  */
 function evaluateGPR(gpr, expressionData) {
   if (!gpr || !gpr.trim()) return 1.0;
 
-  const getExpr = (gene) => {
-    const id = gene.trim();
-    if (expressionData instanceof Map) return expressionData.get(id) ?? 1.0;
-    return expressionData[id] ?? 1.0;
-  };
-
-  const evaluate = (expr) => {
-    expr = expr.trim();
-
-    while (expr.includes('(')) {
-      const start = expr.lastIndexOf('(');
-      const end = expr.indexOf(')', start);
-      const inner = expr.substring(start + 1, end);
-      expr = expr.substring(0, start) + evaluate(inner) + expr.substring(end + 1);
-    }
-
-    if (expr.toLowerCase().includes(' or ')) {
-      return Math.max(...expr.split(/\s+or\s+/i).map(p => evaluate(p)));
-    }
-    if (expr.toLowerCase().includes(' and ')) {
-      return Math.min(...expr.split(/\s+and\s+/i).map(p => evaluate(p)));
-    }
-
-    const num = parseFloat(expr);
-    return isNaN(num) ? getExpr(expr) : num;
-  };
-
-  try {
-    return evaluate(gpr);
-  } catch {
-    return 1.0;
+  // Normalize to Map for GPRExpression.js
+  let exprMap;
+  if (expressionData instanceof Map) {
+    exprMap = expressionData;
+  } else {
+    exprMap = new Map(Object.entries(expressionData || {}));
   }
+
+  return gprToReactionExpression(gpr, exprMap);
 }
 
 /**
@@ -423,9 +420,14 @@ async function solveFBA(model, options = {}) {
  * @param {Object} options - Options including fractionOfOptimum (default 1.0)
  */
 async function solvePFBA(model, options = {}) {
-  // Stage 1: FBA
+  // Stage 1: FBA — get optimal biomass objective
   const fbaResult = await solveFBA(model, options);
   if (fbaResult.status !== 'optimal') return fbaResult;
+
+  // Store biomass objective from Stage 1
+  // CRITICAL: Stage 2 minimizes total flux, but we must return biomass
+  // as the objective value (matching COBRApy convention)
+  const biomassObjective = fbaResult.objectiveValue;
 
   // Stage 2: Minimize flux with fixed objective
   // fractionOfOptimum defaults to 1.0 per Lewis et al. (2010) and COBRApy standard
@@ -438,7 +440,7 @@ async function solvePFBA(model, options = {}) {
       name: 'fix_obj',
       lhs: [{ name: `v_${objRxn}_pos`, coef: 1 }, { name: `v_${objRxn}_neg`, coef: -1 }],
       type: 'ge',
-      rhs: fbaResult.objectiveValue * fractionOfOptimum,
+      rhs: biomassObjective * fractionOfOptimum,
     });
   }
 
@@ -452,7 +454,78 @@ async function solvePFBA(model, options = {}) {
 
   const lpString = solver.buildLPFormat(problem);
   const result = solver.solve(lpString, { log_to_console: false });
-  return formatResult(result, rxnVars, model, 'pfba', options);
+  const formatted = formatResult(result, rxnVars, model, 'pfba', options);
+
+  // CRITICAL FIX: Override objectiveValue with biomass from Stage 1
+  // result.ObjectiveValue is the minimized total flux, NOT biomass
+  formatted.objectiveValue = biomassObjective;
+  return formatted;
+}
+
+/**
+ * Solve linear MOMA (Minimization of Metabolic Adjustment)
+ *
+ * Finds the flux distribution closest to wild-type after a perturbation.
+ * Uses L1-norm linearization: min Σ|v_i - v_wt_i|
+ *
+ * References:
+ * - Segrè et al. (2002) PNAS 99(23):15112-15117
+ * - Becker et al. (2007) BMC Syst Biol 1:2 (linear MOMA)
+ *
+ * @param {Object} model - Metabolic model
+ * @param {Object} options - Options including knockouts
+ */
+async function solveMOMA(model, options = {}) {
+  // Step 1: Wild-type FBA (no knockouts)
+  const wtOptions = { ...options, knockouts: [] };
+  const wtResult = await solveFBA(model, wtOptions);
+  if (wtResult.status !== 'optimal') {
+    return { ...wtResult, method: 'lmoma' };
+  }
+
+  const wtFluxes = wtResult.fluxes;
+
+  // Step 2: Build knockout problem with L1-distance objective
+  const { problem, rxnVars } = buildMetabolicProblem(model, options.constraints, options.knockouts);
+
+  problem.objective = [];
+  problem.sense = 'min';
+
+  rxnVars.forEach(rxnId => {
+    const wtFlux = wtFluxes[rxnId] || 0;
+    const dPosName = `d_${rxnId}_pos`;
+    const dNegName = `d_${rxnId}_neg`;
+
+    problem.variables.push(
+      { name: dPosName, lb: 0, ub: Infinity, type: 'continuous' },
+      { name: dNegName, lb: 0, ub: Infinity, type: 'continuous' },
+    );
+
+    problem.objective.push(
+      { name: dPosName, coef: 1 },
+      { name: dNegName, coef: 1 },
+    );
+
+    // (v_pos - v_neg) - v_wt = d_pos - d_neg
+    problem.constraints.push({
+      name: `moma_dev_${rxnId}`,
+      lhs: [
+        { name: `v_${rxnId}_pos`, coef: 1 },
+        { name: `v_${rxnId}_neg`, coef: -1 },
+        { name: dPosName, coef: -1 },
+        { name: dNegName, coef: 1 },
+      ],
+      type: 'eq',
+      rhs: wtFlux,
+    });
+  });
+
+  const lpString = solver.buildLPFormat(problem);
+  const result = solver.solve(lpString, { log_to_console: false });
+  const formatted = formatResult(result, rxnVars, model, 'lmoma', options);
+  formatted.wildTypeObjective = wtResult.objectiveValue;
+  formatted.totalDeviation = result.ObjectiveValue;
+  return formatted;
 }
 
 /**
@@ -677,14 +750,18 @@ async function solveGIMME(model, options = {}) {
  */
 async function solveEFlux(model, options = {}) {
   const expressionData = options.expressionData || {};
+  // minBound prevents zero-flux bounds that could make the problem infeasible
+  // Matches OmicsIntegration.js E-Flux implementation (Colijn et al. 2009)
+  const minBound = options.minBound ?? 0.01;
   const scaledModel = JSON.parse(JSON.stringify(model));
 
   Object.entries(scaledModel.reactions).forEach(([rxnId, rxn]) => {
     if (rxn.gpr || rxn.gene_reaction_rule) {
       const expr = evaluateGPR(rxn.gpr || rxn.gene_reaction_rule, expressionData);
-      if (expr < 1.0) {
-        if (rxn.upper_bound > 0) rxn.upper_bound *= expr;
-        if (rxn.lower_bound < 0) rxn.lower_bound *= expr;
+      const scalingFactor = Math.max(minBound, Math.min(1.0, expr));
+      if (scalingFactor < 1.0) {
+        if (rxn.upper_bound > 0) rxn.upper_bound *= scalingFactor;
+        if (rxn.lower_bound < 0) rxn.lower_bound *= scalingFactor;
       }
     }
   });
@@ -731,6 +808,9 @@ self.onmessage = async function(event) {
       case 'eflux':
         result = await solveEFlux(model, options);
         break;
+      case 'moma':
+        result = await solveMOMA(model, options);
+        break;
       default:
         throw new Error(`Unknown method: ${method}`);
     }
@@ -747,6 +827,6 @@ initializeSolver().then(success => {
     type: 'ready',
     solverReady: success,
     solver: 'highs-wasm',
-    capabilities: success ? ['LP', 'MILP', 'QP'] : [],
+    capabilities: success ? ['LP', 'MILP'] : [],
   });
 });

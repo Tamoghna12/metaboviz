@@ -93,8 +93,8 @@ export function parseEscherMap(escherMap) {
       textLabels.push({
         id: labelId,
         text: label.text || '',
-        x: normalizeCoord(label.x, canvas.x, canvas.width),
-        y: normalizeCoord(label.y, canvas.y, canvas.height),
+        x: label.x,          // raw Escher coords
+        y: label.y,
         fontSize: label.font_size || 12,
       });
     });
@@ -123,34 +123,28 @@ export function parseEscherMap(escherMap) {
 }
 
 /**
- * Parse an Escher node into MetabolicSuite node format
+ * Parse an Escher node into MetabolicSuite node format.
+ * Midmarker/multimarker nodes are retained (type:'marker') so that reaction
+ * segments can look up their coordinates — they are not rendered as circles.
  */
 function parseEscherNode(nodeId, node, canvas) {
-  // Skip midmarker nodes (used for reaction arrow routing)
-  if (node.node_type === 'midmarker' || node.node_type === 'multimarker') {
-    return null;
-  }
-
+  const isMarker     = node.node_type === 'midmarker' || node.node_type === 'multimarker';
   const isMetabolite = node.node_type === 'metabolite';
-  const isCofactor = node.node_is_primary === false;
+  const isCofactor   = isMetabolite && node.node_is_primary === false;
 
   return {
-    id: nodeId,
-    biggId: node.bigg_id || node.name,
-    name: node.name || node.bigg_id || nodeId,
-    label: node.label_x !== undefined ? node.name : null,
-    type: isMetabolite ? (isCofactor ? 'cofactor' : 'metabolite') : 'marker',
-    x: normalizeCoord(node.x, canvas.x, canvas.width),
-    y: normalizeCoord(node.y, canvas.y, canvas.height),
-    labelX: node.label_x !== undefined
-      ? normalizeCoord(node.label_x, canvas.x, canvas.width)
-      : undefined,
-    labelY: node.label_y !== undefined
-      ? normalizeCoord(node.label_y, canvas.y, canvas.height)
-      : undefined,
-    isPrimary: node.node_is_primary !== false,
-    color: isCofactor ? ESCHER_COLORS.cofactor : ESCHER_COLORS.metabolite,
-    radius: isCofactor ? 6 : 10,
+    id:      nodeId,
+    biggId:  node.bigg_id || node.name,
+    name:    node.name || node.bigg_id || nodeId,
+    label:   isMetabolite ? (node.name || node.bigg_id || null) : null,
+    type:    isMarker ? 'marker' : (isCofactor ? 'cofactor' : 'metabolite'),
+    // Store raw Escher coordinates — EscherMapView's computeBBox + fitToScreen handles scaling
+    x:       node.x,
+    y:       node.y,
+    labelX:  node.label_x,
+    labelY:  node.label_y,
+    isPrimary: !isCofactor,
+    radius:  isMarker ? 0 : (isCofactor ? 6 : 12),
   };
 }
 
@@ -187,14 +181,14 @@ function parseEscherReaction(reactionId, reaction, nodeIdMap, nodes, canvas) {
       return; // Skip incomplete segments
     }
 
-    // Create edge with bezier control points if present
+    // Create edge with raw Escher coordinates
     const edge = {
       id: `${reactionId}_${segmentId}`,
       reactionId: reactionMeta.biggId,
       reactionName: reactionMeta.name,
       from: fromNode.id,
       to: toNode.id,
-      fromX: fromNode.x,
+      fromX: fromNode.x,   // raw Escher coords
       fromY: fromNode.y,
       toX: toNode.x,
       toY: toNode.y,
@@ -204,25 +198,24 @@ function parseEscherReaction(reactionId, reaction, nodeIdMap, nodes, canvas) {
       strokeWidth: 2,
     };
 
-    // Add bezier control points if available
+    // Bezier control points (raw Escher coords)
     if (segment.b1 && segment.b2) {
       edge.bezier = {
-        b1x: normalizeCoord(segment.b1.x, canvas.x, canvas.width),
-        b1y: normalizeCoord(segment.b1.y, canvas.y, canvas.height),
-        b2x: normalizeCoord(segment.b2.x, canvas.x, canvas.width),
-        b2y: normalizeCoord(segment.b2.y, canvas.y, canvas.height),
+        b1x: segment.b1.x,
+        b1y: segment.b1.y,
+        b2x: segment.b2.x,
+        b2y: segment.b2.y,
       };
     }
 
     edges.push(edge);
   });
 
-  // Add reaction label position
-  if (reaction.label_x !== undefined && reaction.label_y !== undefined) {
-    edges.forEach(e => {
-      e.labelX = normalizeCoord(reaction.label_x, canvas.x, canvas.width);
-      e.labelY = normalizeCoord(reaction.label_y, canvas.y, canvas.height);
-    });
+  // Reaction label position (raw Escher coords; only mark first segment per reaction)
+  if (reaction.label_x !== undefined && reaction.label_y !== undefined && edges.length > 0) {
+    edges[0].label   = reactionMeta.biggId;
+    edges[0].labelX  = reaction.label_x;
+    edges[0].labelY  = reaction.label_y;
   }
 
   return edges;

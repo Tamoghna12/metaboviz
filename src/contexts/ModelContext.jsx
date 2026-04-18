@@ -43,6 +43,7 @@ export const ModelProvider = ({ children }) => {
         description: `Uploaded from ${file.name}`,
         genes: parsedModel.genes,
         reactions: parsedModel.reactions,
+        metabolites: parsedModel.metabolites,
         nodes: parsedModel.nodes,
         edges: parsedModel.edges,
         isDefault: false,
@@ -94,6 +95,7 @@ export const ModelProvider = ({ children }) => {
   const modelStats = {
     genes: Object.keys(currentModel.genes || {}).length,
     reactions: Object.keys(currentModel.reactions || {}).length,
+    metabolites: Object.keys(currentModel.metabolites || {}).length,
     nodes: (currentModel.nodes || []).length,
     edges: (currentModel.edges || []).length
   };
@@ -108,6 +110,18 @@ export const ModelProvider = ({ children }) => {
     Object.values(currentModel.reactions || {}).map(r => r.subsystem).filter(Boolean)
   )].sort();
 
+  const updateReactions = useCallback((updates) => {
+    // updates: { rxnId: { lower_bound?, upper_bound?, gene_reaction_rule?, name?, subsystem? } }
+    setCurrentModel(prev => ({
+      ...prev,
+      reactions: Object.fromEntries(
+        Object.entries(prev.reactions || {}).map(([id, rxn]) =>
+          updates[id] ? [id, { ...rxn, ...updates[id] }] : [id, rxn]
+        )
+      )
+    }));
+  }, []);
+
   const value = {
     currentModel,
     loading,
@@ -118,6 +132,7 @@ export const ModelProvider = ({ children }) => {
     selectModel,
     resetToDefault,
     removeModel,
+    updateReactions,
     modelStats,
     exchangeReactions,
     subsystems,

@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@tailwindcss/postcss": "^4.1.18",
+    "cytoscape": "^3.33.2",
     "glpk.js": "^5.0.0",
     "highs": "^1.8.0",
     "lucide-react": "^0.562.0",

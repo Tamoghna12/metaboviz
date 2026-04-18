@@ -95,9 +95,9 @@ const INTEGRATION_METHODS = [
   },
   {
     id: 'made',
-    name: 'MADE',
-    description: 'Differential expression comparison',
-    reference: 'Jensen & Papin (2011) Bioinformatics',
+    name: 'Differential E-Flux',
+    description: 'Comparative E-Flux between two conditions',
+    reference: 'Colijn et al. (2009) Mol Syst Biol',
     complexity: 'Medium',
     requirements: ['transcriptomics'],
     needsComparison: true
@@ -205,7 +205,7 @@ export const OmicsDataUpload = ({ compact = false, onIntegrationResult = null })
           }
           const controlData = getExpressionMap(OMICS_TYPES.TRANSCRIPTOMICS, selectedCondition[OMICS_TYPES.TRANSCRIPTOMICS]);
           const treatmentData = getExpressionMap(OMICS_TYPES.TRANSCRIPTOMICS, comparisonCondition);
-          result = await OmicsIntegration.solveMADE(currentModel, controlData, treatmentData);
+          result = await OmicsIntegration.solveDifferentialEFlux(currentModel, controlData, treatmentData);
           break;
         }
 

@@ -61,14 +61,20 @@ export const parseSBML = (xmlString) => {
   // Parse gene products (SBML L3 FBC)
   const geneProducts = parseGeneProducts(modelElement);
 
-  // Parse reactions
-  const { reactions, genes } = parseReactions(modelElement, species, geneProducts, level);
+  // Parse global parameters FIRST so FBC flux bound references can be resolved
+  const parameterLookup = parseParameterLookup(modelElement);
+
+  // Parse reactions (passing parameterLookup for FBC bound resolution)
+  const { reactions, genes } = parseReactions(modelElement, species, geneProducts, level, parameterLookup);
 
   // Parse layout information if available
   const layoutInfo = parseLayout(modelElement);
 
   // Generate visualization graph
   const { nodes, edges } = generateGraphFromSBML(reactions, metabolites, species, layoutInfo);
+
+  // Parse FBC v2 objectives (listOfObjectives) and apply to reactions
+  parseFBCObjectives(modelElement, reactions);
 
   // Extract flux bounds if FBC package is used
   const fluxBounds = parseFluxBounds(modelElement, reactions);
@@ -205,9 +211,28 @@ const parseGeneProducts = (modelElement) => {
 };
 
 /**
+ * Parse global parameters into a lookup map (ID → numeric value).
+ * Used to resolve FBC v2 flux bound parameter references.
+ */
+const parseParameterLookup = (modelElement) => {
+  const lookup = {};
+  const paramList = modelElement.querySelector('listOfParameters');
+  if (paramList) {
+    paramList.querySelectorAll('parameter').forEach(param => {
+      const id = param.getAttribute('id');
+      const value = parseFloat(param.getAttribute('value') || '0');
+      if (id && !isNaN(value)) {
+        lookup[id] = value;
+      }
+    });
+  }
+  return lookup;
+};
+
+/**
  * Parse reactions from SBML
  */
-const parseReactions = (modelElement, species, geneProducts, level) => {
+const parseReactions = (modelElement, species, geneProducts, level, parameterLookup = {}) => {
   const reactions = {};
   const genes = {};
   const reactionList = modelElement.querySelector('listOfReactions');
@@ -246,8 +271,8 @@ const parseReactions = (modelElement, species, geneProducts, level) => {
         }
       });
 
-      // Parse flux bounds
-      const bounds = parseReactionBounds(rxn, reversible);
+      // Parse flux bounds (resolve FBC parameter references)
+      const bounds = parseReactionBounds(rxn, reversible, parameterLookup);
 
       // Parse subsystem from notes or annotation
       const subsystem = parseSubsystem(rxn) || determineSubsystem(id, name);
@@ -394,10 +419,12 @@ const parseGPRAssociation = (element) => {
   const genes = [];
   let gpr = '';
 
-  // Check for AND/OR elements
-  const andElement = element.querySelector('and, fbc\\:and');
-  const orElement = element.querySelector('or, fbc\\:or');
-  const geneRefElement = element.querySelector('geneProductRef, fbc\\:geneProductRef');
+  // Check for AND/OR elements — use direct children only to avoid
+  // matching nested descendants (which would flatten the tree)
+  const children = Array.from(element.children);
+  const andElement = children.find(c => c.localName === 'and');
+  const orElement = children.find(c => c.localName === 'or');
+  const geneRefElement = children.find(c => c.localName === 'geneProductRef');
 
   if (andElement) {
     const children = [];
@@ -460,31 +487,88 @@ const extractGeneIds = (gprString) => {
 };
 
 /**
- * Parse reaction bounds from FBC package or kinetic law
+ * Parse reaction bounds from FBC package or kinetic law.
+ *
+ * FBC v2 stores bounds as references to global <parameter> elements
+ * (e.g., fbc:lowerFluxBound="cobra_default_lb"). We resolve these to
+ * actual numeric values from the model's listOfParameters.
+ *
+ * Reference: Olivier & Bergmann (2018) "FBC package specification v2"
+ *
+ * @param {Element} rxnElement - Reaction DOM element
+ * @param {boolean} reversible - Whether reaction is reversible
+ * @param {Object} parameterLookup - Map of parameter ID → numeric value
+ * @returns {{ lower: number, upper: number }}
  */
-const parseReactionBounds = (rxnElement, reversible) => {
+const parseReactionBounds = (rxnElement, reversible, parameterLookup = {}) => {
   let lower = reversible ? -1000 : 0;
   let upper = 1000;
 
-  // Try FBC bounds
-  const lowerBound = rxnElement.getAttributeNS(SBML_NS.fbc, 'lowerFluxBound') ||
-                     rxnElement.getAttribute('fbc:lowerFluxBound');
-  const upperBound = rxnElement.getAttributeNS(SBML_NS.fbc, 'upperFluxBound') ||
-                     rxnElement.getAttribute('fbc:upperFluxBound');
+  // Try FBC bounds (these are parameter ID references, not values)
+  const lowerBoundRef = rxnElement.getAttributeNS(SBML_NS.fbc, 'lowerFluxBound') ||
+                        rxnElement.getAttribute('fbc:lowerFluxBound');
+  const upperBoundRef = rxnElement.getAttributeNS(SBML_NS.fbc, 'upperFluxBound') ||
+                        rxnElement.getAttribute('fbc:upperFluxBound');
 
-  if (lowerBound) {
-    // This is a reference to a parameter, we'd need to resolve it
-    // For now, use default values based on parameter name patterns
-    if (lowerBound.includes('zero') || lowerBound.includes('ZERO')) lower = 0;
-    else if (lowerBound.includes('minus') || lowerBound.includes('MINUS')) lower = -1000;
+  // Resolve parameter references to numeric values
+  if (lowerBoundRef && parameterLookup[lowerBoundRef] !== undefined) {
+    lower = parameterLookup[lowerBoundRef];
+  } else if (lowerBoundRef) {
+    // Fallback: pattern matching for common parameter naming conventions
+    // This handles models that don't include listOfParameters
+    const ref = lowerBoundRef.toLowerCase();
+    if (ref.includes('zero')) lower = 0;
+    else if (ref.includes('minus') || ref.includes('neg')) lower = -1000;
   }
 
-  if (upperBound) {
-    if (upperBound.includes('zero') || upperBound.includes('ZERO')) upper = 0;
-    else if (upperBound.includes('plus') || upperBound.includes('PLUS')) upper = 1000;
+  if (upperBoundRef && parameterLookup[upperBoundRef] !== undefined) {
+    upper = parameterLookup[upperBoundRef];
+  } else if (upperBoundRef) {
+    const ref = upperBoundRef.toLowerCase();
+    if (ref.includes('zero')) upper = 0;
+    else if (ref.includes('plus') || ref.includes('pos')) upper = 1000;
   }
 
   return { lower, upper };
+};
+
+/**
+ * Parse FBC v2 listOfObjectives and apply objective coefficients to reactions.
+ *
+ * FBC v2 spec: The active objective is identified by fbc:activeObjective on the
+ * model element. Each objective contains fluxObjective elements that reference
+ * reactions with a coefficient.
+ *
+ * Reference: Olivier & Bergmann (2018) "FBC package v2" §3.5
+ */
+const parseFBCObjectives = (modelElement, reactions) => {
+  const objList = modelElement.querySelector('listOfObjectives, fbc\\:listOfObjectives');
+  if (!objList) return;
+
+  // Find active objective
+  const activeObjId = objList.getAttributeNS(SBML_NS.fbc, 'activeObjective') ||
+                      objList.getAttribute('fbc:activeObjective') ||
+                      objList.getAttribute('activeObjective');
+
+  const objectives = objList.querySelectorAll('objective, fbc\\:objective');
+  for (const obj of objectives) {
+    const objId = obj.getAttribute('id') || obj.getAttributeNS(SBML_NS.fbc, 'id');
+    // Only process the active objective (or the first one if no active is specified)
+    if (activeObjId && objId !== activeObjId) continue;
+
+    const fluxObjList = obj.querySelectorAll('fluxObjective, fbc\\:fluxObjective');
+    for (const fo of fluxObjList) {
+      const rxnRef = fo.getAttribute('reaction') || fo.getAttributeNS(SBML_NS.fbc, 'reaction');
+      const coef = parseFloat(
+        fo.getAttribute('coefficient') ||
+        fo.getAttributeNS(SBML_NS.fbc, 'coefficient') || '1'
+      );
+      if (rxnRef && reactions[rxnRef]) {
+        reactions[rxnRef].objective_coefficient = coef;
+      }
+    }
+    break; // Only process one objective
+  }
 };
 
 /**
@@ -528,10 +612,16 @@ const parseFluxBounds = (modelElement, reactions) => {
 };
 
 /**
- * Parse objective coefficient for FBA
+ * Parse objective coefficient for FBA.
+ *
+ * FBC v1: attribute on reaction element (fbc:objective_coefficient)
+ * FBC v2: defined in listOfObjectives > objective > listOfFluxObjectives
+ *
+ * This function handles the v1 attribute style. FBC v2 objectives are
+ * resolved separately in parseFBCObjectives() and applied post-parse.
  */
 const parseObjectiveCoefficient = (rxnElement) => {
-  // Check for FBC objective coefficient
+  // FBC v1 style: attribute directly on reaction
   const coef = rxnElement.getAttributeNS(SBML_NS.fbc, 'objective_coefficient') ||
                rxnElement.getAttribute('fbc:objective_coefficient');
   return coef ? parseFloat(coef) : 0;

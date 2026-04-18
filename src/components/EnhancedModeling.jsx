@@ -556,7 +556,7 @@ const SolverSelector = ({ method, onChange }) => {
   const options = [
     { id: 'standard', label: 'FBA', desc: 'Standard linear programming' },
     { id: 'pfba', label: 'pFBA', desc: 'Minimize total flux' },
-    { id: 'moma', label: 'MOMA', desc: 'Knockout adaptation' },
+    { id: 'moma', label: 'lMOMA', desc: 'Linear MOMA (knockout adaptation)' },
     { id: 'fva', label: 'FVA', desc: 'Flux variability' }
   ];
 

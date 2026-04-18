@@ -17,7 +17,8 @@
  * @module OmicsIntegration
  */
 
-import { solveFBA, evaluateGPR, extractAllGenes, buildStoichiometricMatrix } from './FBASolver';
+import { solveFBA, extractAllGenes, buildStoichiometricMatrix } from './FBASolver';
+import { gprToReactionExpression } from './GPRExpression';
 import GLPK from 'glpk.js';
 
 let glpkInstance = null;
@@ -28,131 +29,8 @@ const getGLPK = async () => {
   return glpkInstance;
 };
 
-/**
- * Apply GPR rules to convert gene expression to reaction expression.
- *
- * For AND relationships: min(expression levels)
- * For OR relationships: max(expression levels)
- *
- * @param {string} gprString - GPR rule string
- * @param {Map<string, number>} geneExpression - Gene ID to expression level map
- * @returns {number} - Reaction expression level
- */
-export function gprToReactionExpression(gprString, geneExpression) {
-  if (!gprString || gprString.trim() === '') return 1.0;
-
-  try {
-    const tokens = tokenizeGPR(gprString);
-    const ast = parseGPRTokens(tokens);
-    return evaluateGPRExpression(ast, geneExpression);
-  } catch (e) {
-    console.warn('GPR expression evaluation failed:', gprString, e);
-    return 1.0;
-  }
-}
-
-function tokenizeGPR(gprString) {
-  const tokens = [];
-  let current = '';
-
-  for (let i = 0; i < gprString.length; i++) {
-    const char = gprString[i];
-
-    if (char === '(' || char === ')') {
-      if (current.trim()) tokens.push(current.trim());
-      tokens.push(char);
-      current = '';
-    } else if (char === ' ') {
-      if (current.trim()) {
-        const word = current.trim().toLowerCase();
-        if (word === 'and' || word === 'or') {
-          tokens.push(word.toUpperCase());
-        } else {
-          tokens.push(current.trim());
-        }
-      }
-      current = '';
-    } else {
-      current += char;
-    }
-  }
-
-  if (current.trim()) {
-    const word = current.trim().toLowerCase();
-    if (word === 'and' || word === 'or') {
-      tokens.push(word.toUpperCase());
-    } else {
-      tokens.push(current.trim());
-    }
-  }
-
-  return tokens;
-}
-
-function parseGPRTokens(tokens) {
-  let pos = 0;
-
-  function parseExpression() {
-    let left = parseTerm();
-
-    while (pos < tokens.length && tokens[pos] === 'OR') {
-      pos++;
-      const right = parseTerm();
-      left = { type: 'OR', left, right };
-    }
-
-    return left;
-  }
-
-  function parseTerm() {
-    let left = parseFactor();
-
-    while (pos < tokens.length && tokens[pos] === 'AND') {
-      pos++;
-      const right = parseFactor();
-      left = { type: 'AND', left, right };
-    }
-
-    return left;
-  }
-
-  function parseFactor() {
-    if (tokens[pos] === '(') {
-      pos++;
-      const expr = parseExpression();
-      if (tokens[pos] === ')') pos++;
-      return expr;
-    }
-
-    const gene = tokens[pos++];
-    return { type: 'GENE', id: gene };
-  }
-
-  return parseExpression();
-}
-
-function evaluateGPRExpression(ast, geneExpression) {
-  if (!ast) return 1.0;
-
-  switch (ast.type) {
-    case 'GENE':
-      return geneExpression.get(ast.id) ?? 1.0;
-    case 'AND':
-      // For enzyme complexes: limiting factor determines expression
-      return Math.min(
-        evaluateGPRExpression(ast.left, geneExpression),
-        evaluateGPRExpression(ast.right, geneExpression)
-      );
-    case 'OR':
-      // For isozymes: highest expression dominates
-      return Math.max(
-        evaluateGPRExpression(ast.left, geneExpression),
-        evaluateGPRExpression(ast.right, geneExpression)
-      );
-    default:
-      return 1.0;
-  }
-}
+// gprToReactionExpression imported from GPRExpression.js (single canonical implementation)
+export { gprToReactionExpression } from './GPRExpression';
 
 /**
  * GIMME - Gene Inactivity Moderated by Metabolism and Expression
@@ -600,9 +478,11 @@ async function solveIMATWithMILP(model, reactionExpression, highExprReactions, l
   });
 
   // Low-expression constraints: |v| <= M * (1 - y_l)
+  // When y_l = 1 (inactive): v <= 0 and v >= 0, so v = 0
+  // When y_l = 0 (active): v <= M and v >= -M (unconstrained)
   lowExprReactions.forEach((rxnId, i) => {
-    lp += ` l_ub_${i}: v_${rxnId} - ${M} y_l_${i} <= ${M}\n`;
-    lp += ` l_lb_${i}: v_${rxnId} + ${M} y_l_${i} >= -${M}\n`;
+    lp += ` l_ub_${i}: v_${rxnId} + ${M} y_l_${i} <= ${M}\n`;
+    lp += ` l_lb_${i}: v_${rxnId} - ${M} y_l_${i} >= -${M}\n`;
   });
 
   // Bounds
@@ -754,18 +634,23 @@ async function solveIMATRelaxed(model, reactionExpression, highExprReactions, lo
 }
 
 /**
- * MADE - Metabolic Adjustment by Differential Expression
+ * Differential E-Flux - Comparative flux analysis between two conditions.
  *
- * Adjusts reaction bounds based on differential expression between
- * two conditions.
+ * Runs E-Flux independently on control and treatment expression data,
+ * then computes fold changes in predicted fluxes.
+ *
+ * NOTE: This is NOT an implementation of MADE (Jensen & Papin 2011,
+ * Bioinformatics 27(4):541-547), which uses a statistical test on
+ * differential expression to constrain reaction directionality changes.
+ * This is a simpler comparative E-Flux approach.
  *
  * @param {Object} model - Parsed metabolic model
  * @param {Map<string, number>} controlExpression - Control condition expression
  * @param {Map<string, number>} treatmentExpression - Treatment condition expression
- * @param {Object} options - MADE options
+ * @param {Object} options - Options
  * @returns {Promise<Object>} - Comparative analysis results
  */
-export async function solveMADE(model, controlExpression, treatmentExpression, options = {}) {
+export async function solveDifferentialEFlux(model, controlExpression, treatmentExpression, options = {}) {
   const {
     foldChangeThreshold = 2.0, // Log2 fold change threshold
     objective = null
@@ -825,8 +710,8 @@ export async function solveMADE(model, controlExpression, treatmentExpression, o
         ? ((treatmentResult.objectiveValue - controlResult.objectiveValue) / controlResult.objectiveValue) * 100
         : 0
     },
-    method: 'MADE',
-    reference: 'Jensen & Papin (2011) Bioinformatics'
+    method: 'Differential E-Flux',
+    reference: 'Colijn et al. (2009) Mol Syst Biol (comparative application)'
   };
 }
 
@@ -981,7 +866,7 @@ export default {
   solveGIMME,
   solveEFlux,
   solveIMAT,
-  solveMADE,
+  solveDifferentialEFlux,
   integrateMetabolomics,
   integratedOmicsAnalysis,
   gprToReactionExpression
