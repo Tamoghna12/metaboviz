@@ -328,8 +328,8 @@ If you use MetaboViz in a publication or poster, please cite:
 ```bibtex
 @software{metaboviz2025,
   title   = {MetaboViz: Browser-native Genome-Scale Metabolic Model Visualizer},
-  author  = {Tamoghna Ghosh},
-  year    = {2025},
+  author  = {Tamoghna Das},
+  year    = {2026},
   url     = {https://github.com/Tamoghna12/metaboviz},
   license = {MIT}
 }
