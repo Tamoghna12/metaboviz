@@ -13,7 +13,10 @@
  */
 
 // Backend configuration
-const DEFAULT_BACKEND_URL = 'http://localhost:8000';
+// VITE_BACKEND_URL is injected at build time (set in Railway / .env.local)
+const DEFAULT_BACKEND_URL =
+  (typeof import.meta !== 'undefined' && import.meta.env?.VITE_BACKEND_URL) ||
+  'http://localhost:8000';
 const TIMEOUT_MS = 60000; // 60 second timeout for heavy computations
 
 /**

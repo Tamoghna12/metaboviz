@@ -233,9 +233,10 @@ function GraphView({ reactions, metabolites, isDark, fluxes = {}, phenotype = nu
       cy.nodes('[nodeType="reaction"]').forEach(n => {
         n.style({ 'background-color': isDark ? '#374151' : '#f1f5f9', 'border-color': isDark ? '#6b7280' : '#94a3b8', opacity: 1 });
       });
-      cy.edges().forEach(e => { e.style({ width: 1.5, 'line-color': isDark ? '#4b5563' : '#9ca3af', 'target-arrow-color': isDark ? '#4b5563' : '#9ca3af', opacity: 0.6 }); });
+      cy.edges().forEach(e => { e.style({ width: 1.5, 'line-color': isDark ? '#4b5563' : '#9ca3af', 'target-arrow-color': isDark ? '#4b5563' : '#9ca3af', opacity: 0.6, 'line-style': 'solid' }); });
       return;
     }
+    cy.edges().removeClass('flux-live');
     cy.nodes('[nodeType="reaction"]').forEach(n => {
       const rxnId = n.id();
       const v = fluxes[rxnId];
@@ -244,14 +245,27 @@ function GraphView({ reactions, metabolites, isDark, fluxes = {}, phenotype = nu
         const col = v > 0 ? '#22c55e' : '#f97316';
         n.style({ 'background-color': col, 'border-color': col, opacity: 1, color: '#fff' });
         n.connectedEdges().forEach(e => {
-          e.style({ width: Math.min(8, 1.5 + Math.abs(v) * 0.3), 'line-color': col, 'target-arrow-color': col, opacity: 0.85 });
+          e.addClass('flux-live');
+          e.style({ width: Math.min(8, 1.5 + Math.abs(v) * 0.3), 'line-color': col, 'target-arrow-color': col, opacity: 0.85, 'line-style': 'dashed', 'line-dash-pattern': [8, 4] });
         });
       } else {
         n.style({ 'background-color': isDark ? '#1f2937' : '#e2e8f0', 'border-color': isDark ? '#374151' : '#cbd5e1', opacity: 0.25, color: isDark ? '#6b7280' : '#9ca3af' });
-        n.connectedEdges().forEach(e => { e.style({ opacity: 0.1 }); });
+        n.connectedEdges().forEach(e => { e.style({ opacity: 0.1, 'line-style': 'solid' }); });
       }
     });
   }, [fluxes, phenotype, isDark, hasFluxes]);
+
+  // Marching-ants animation: increment line-dash-offset on active flux edges
+  useEffect(() => {
+    const cy = cyRef.current;
+    if (!cy || !hasFluxes) return;
+    let t = 0;
+    const id = setInterval(() => {
+      t = (t + 2) % 100;
+      cy.edges('.flux-live').style({ 'line-dash-offset': -t });
+    }, 40);
+    return () => clearInterval(id);
+  }, [hasFluxes]);
 
   return (
     <div className="relative w-full h-full">

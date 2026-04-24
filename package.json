@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:edge": "cd ../edge-api && python3 main.py",
+    "dev:full": "python3 ../edge-api/main.py & vite; kill %1",
     "build": "vite build",
     "build:widget": "vite build --config vite.widget.config.js",
     "build:all": "npm run build && npm run build:widget",

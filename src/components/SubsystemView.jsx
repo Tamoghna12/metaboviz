@@ -24,18 +24,17 @@
  */
 
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { Layers, Zap, FlaskConical, Dna, Download, BarChart2, FileText, Map as MapIcon } from 'lucide-react';
+import { Layers, Zap, FlaskConical, Dna, Download, BarChart2, FileText, Pencil, Trash2, Check, X as XIcon } from 'lucide-react';
 import { useTheme } from '../contexts/ThemeContext';
 import { useModel } from '../contexts/ModelContext';
+import { downloadJSON, downloadSBML } from '../lib/ModelExporter';
 import NetworkCanvas from './NetworkCanvas';
-import EscherMapView from './EscherMapView';
 
 const TABS = [
-  { id: 'pathways',    label: 'Pathways',    Icon: Layers      },
+  { id: 'pathways',    label: 'Overview',    Icon: Layers      },
   { id: 'reactions',   label: 'Reactions',   Icon: Zap         },
   { id: 'metabolites', label: 'Metabolites', Icon: FlaskConical },
   { id: 'genes',       label: 'Genes',       Icon: Dna         },
-  { id: 'maps',        label: 'Maps',        Icon: MapIcon     },
   { id: 'export',      label: 'Export',      Icon: Download    },
 ];
 
@@ -80,9 +79,46 @@ const PATHWAY_CATEGORIES = {
   'Other': []  // Fallback category
 };
 
+// ── DonutChart — pure SVG, no library ────────────────────────────────────────
+function DonutChart({ data, total, size = 108, centerValue, centerLabel }) {
+  const r = 34, cx = size / 2, cy = size / 2;
+  const circ = 2 * Math.PI * r;
+  let cum = 0;
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+      <circle cx={cx} cy={cy} r={r} fill="none" stroke="var(--border-subtle)" strokeWidth={13} />
+      {data.map((d, i) => {
+        const pct = d.value / total;
+        const dash = pct * circ;
+        const offset = -(cum / total) * circ;
+        cum += d.value;
+        return (
+          <circle key={i} cx={cx} cy={cy} r={r}
+            fill="none" stroke={d.color} strokeWidth={13}
+            strokeDasharray={`${dash} ${circ - dash}`}
+            strokeDashoffset={offset}
+            strokeLinecap="butt"
+            style={{ transform: `rotate(-90deg)`, transformOrigin: `${cx}px ${cy}px` }}
+          />
+        );
+      })}
+      {centerValue !== undefined && <>
+        <text x={cx} y={cy - 2} textAnchor="middle" dominantBaseline="middle"
+          fontSize={15} fontWeight="600" fill="var(--text-primary)" fontFamily="var(--font-mono)">
+          {centerValue}
+        </text>
+        <text x={cx} y={cy + 14} textAnchor="middle" dominantBaseline="middle"
+          fontSize={8} fill="var(--text-muted)">
+          {centerLabel}
+        </text>
+      </>}
+    </svg>
+  );
+}
+
 const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 700, onReactionSelect }) => {
   const { isDark, accessibleColors } = useTheme();
-  const { currentModel, updateReactions } = useModel();
+  const { currentModel, updateReactions, deleteReaction } = useModel();
   const searchInputRef = useRef(null);
   const treemapRef = useRef(null);
   const csvImportRef = useRef(null);
@@ -301,29 +337,29 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
     };
   }, [subsystems, fluxes]);
 
-  // Semantic color per category name (not flux-dependent)
+  // Muted, professional palette — distinct but not distracting
   const CATEGORY_PALETTE = {
-    'Carbohydrate Metabolism':    { bg: '#f97316', light: '#fff7ed', border: '#fb923c' },
-    'Amino Acid Metabolism':      { bg: '#22c55e', light: '#f0fdf4', border: '#4ade80' },
-    'Energy Metabolism':          { bg: '#eab308', light: '#fefce8', border: '#facc15' },
-    'Lipid Metabolism':           { bg: '#a855f7', light: '#faf5ff', border: '#c084fc' },
-    'Nucleotide Metabolism':      { bg: '#3b82f6', light: '#eff6ff', border: '#60a5fa' },
-    'Cofactor & Vitamin Metabolism': { bg: '#14b8a6', light: '#f0fdfa', border: '#2dd4bf' },
-    'Cell Envelope':              { bg: '#f43f5e', light: '#fff1f2', border: '#fb7185' },
-    'Transport':                  { bg: '#6366f1', light: '#eef2ff', border: '#818cf8' },
-    'Other':                      { bg: '#6b7280', light: '#f9fafb', border: '#9ca3af' },
+    'Carbohydrate Metabolism':        { bg: '#3d7a5a', light: '#f0fdf8', border: '#5a9e78' },
+    'Amino Acid Metabolism':          { bg: '#2d6a8a', light: '#f0f8fd', border: '#4a8aaa' },
+    'Energy Metabolism':              { bg: '#7a6230', light: '#fdf8f0', border: '#9a8250' },
+    'Lipid Metabolism':               { bg: '#5a4a7a', light: '#f8f0fd', border: '#7a6a9a' },
+    'Nucleotide Metabolism':          { bg: '#1e3a6e', light: '#f0f4fd', border: '#3a5a8e' },
+    'Cofactor & Vitamin Metabolism':  { bg: '#2a6a6a', light: '#f0fdfd', border: '#4a8a8a' },
+    'Cell Envelope':                  { bg: '#6a3a4a', light: '#fdf0f4', border: '#8a5a6a' },
+    'Transport':                      { bg: '#3a4a6a', light: '#f0f2fd', border: '#5a6a8a' },
+    'Other':                          { bg: '#4a5260', light: '#f8f9fa', border: '#6a7280' },
   };
 
   const CATEGORY_ICONS = {
-    'Carbohydrate Metabolism': '🍬',
-    'Amino Acid Metabolism': '🧬',
-    'Energy Metabolism': '⚡',
-    'Lipid Metabolism': '💧',
-    'Nucleotide Metabolism': '🔵',
-    'Cofactor & Vitamin Metabolism': '💊',
-    'Cell Envelope': '🛡️',
-    'Transport': '🔄',
-    'Other': '📦',
+    'Carbohydrate Metabolism':        'CHO',
+    'Amino Acid Metabolism':          'AA',
+    'Energy Metabolism':              'E',
+    'Lipid Metabolism':               'FA',
+    'Nucleotide Metabolism':          'NT',
+    'Cofactor & Vitamin Metabolism':  'COF',
+    'Cell Envelope':                  'CE',
+    'Transport':                      'TR',
+    'Other':                          '—',
   };
 
   const getCategoryPalette = useCallback((name) =>
@@ -477,7 +513,14 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
 
     const rxnList = Object.values(reactions);
     const reversible = rxnList.filter(r => (r.lower_bound ?? -1000) < 0).length;
-    const withGPR = rxnList.filter(r => r.gene_reaction_rule).length;
+    // GPR coverage: try gene_reaction_rule strings first; fall back to gene→reaction associations
+    const rxnsWithGenes = new Set();
+    Object.values(genes).forEach(g => (g.reactions || []).forEach(rid => rxnsWithGenes.add(rid)));
+    const withGPR = rxnList.filter(r =>
+      (r.gene_reaction_rule && r.gene_reaction_rule.trim()) ||
+      (r.gpr && r.gpr.trim()) ||
+      rxnsWithGenes.has(r.id)
+    ).length;
     const exchange = rxnList.filter(r => r.id?.startsWith('EX_') || r.subsystem?.toLowerCase().includes('exchange')).length;
     const blocked = rxnList.filter(r => r.lower_bound === 0 && r.upper_bound === 0).length;
 
@@ -488,59 +531,185 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
     const pctGPR = rxnList.length ? Math.round((withGPR / rxnList.length) * 100) : 0;
 
     const statCards = [
-      { label: 'Reactions', value: rxnList.length.toLocaleString(), sub: `${pctRev}% reversible`, color: '#3b82f6', icon: '⚡' },
-      { label: 'Metabolites', value: metList.length.toLocaleString(), sub: `${compartments.length} compartments`, color: '#10b981', icon: '🧪' },
-      { label: 'Genes', value: Object.keys(genes).length.toLocaleString(), sub: `${pctGPR}% rxn coverage`, color: '#8b5cf6', icon: '🧬' },
-      { label: 'Subsystems', value: subsystems.size.toLocaleString(), sub: `${categoryHierarchy.size} categories`, color: '#f59e0b', icon: '🗂️' },
-      { label: 'Exchange rxns', value: exchange.toLocaleString(), sub: 'boundary reactions', color: '#6366f1', icon: '🔄' },
-      { label: 'Blocked rxns', value: blocked.toLocaleString(), sub: 'lb=ub=0', color: blocked > 0 ? '#ef4444' : '#94a3b8', icon: '🚫' },
+      { label: 'Reactions',     value: rxnList.length.toLocaleString(),        sub: `${pctRev}% reversible`         },
+      { label: 'Metabolites',   value: metList.length.toLocaleString(),        sub: `${compartments.length} compartments` },
+      { label: 'Genes',         value: Object.keys(genes).length.toLocaleString(), sub: `${pctGPR}% rxn coverage`   },
+      { label: 'Subsystems',    value: subsystems.size.toLocaleString(),       sub: `${categoryHierarchy.size} categories` },
+      { label: 'Exchange',      value: exchange.toLocaleString(),              sub: 'boundary reactions'            },
+      { label: 'Blocked',       value: blocked.toLocaleString(),               sub: 'lb = ub = 0'                  },
     ];
 
-    // Category bar chart data
-    const categoryList = Array.from(categoryHierarchy.entries())
-      .sort((a, b) => b[1].totalReactions - a[1].totalReactions);
-    const maxCatRxns = categoryList[0]?.[1].totalReactions || 1;
-
     return (
-      <div className="px-4 pt-2 pb-0 space-y-4">
-        {/* Stat cards */}
-        <div className="grid grid-cols-3 md:grid-cols-6 gap-3">
-          {statCards.map(s => (
-            <div key={s.label} className="bg-[var(--card-bg)] border border-[var(--card-border)] rounded-xl p-3 flex flex-col gap-1">
-              <div className="flex items-center justify-between">
-                <span className="text-lg">{s.icon}</span>
-                <span className="text-[10px] font-medium text-[var(--text-muted)] uppercase tracking-wide">{s.label}</span>
-              </div>
-              <span className="text-2xl font-bold" style={{ color: s.color }}>{s.value}</span>
-              <span className="text-[10px] text-[var(--text-muted)]">{s.sub}</span>
+      <div className="px-4 pt-3 pb-0 space-y-3">
+        {/* Stat row — flat, monochrome, information-dense */}
+        <div className="grid grid-cols-3 md:grid-cols-6" style={{ border: '1px solid var(--border-color)', borderRadius: 3, overflow: 'hidden' }}>
+          {statCards.map((s, i) => (
+            <div key={s.label} className="p-3 flex flex-col gap-0.5"
+              style={{
+                background: 'var(--bg-secondary)',
+                borderRight: i < statCards.length - 1 ? '1px solid var(--border-color)' : 'none',
+              }}>
+              <span className="text-[10px] font-medium uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>{s.label}</span>
+              <span className="text-xl font-semibold" style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', letterSpacing: '-0.02em' }}>{s.value}</span>
+              <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>{s.sub}</span>
             </div>
           ))}
         </div>
 
-        {/* Horizontal category breakdown bar */}
-        <div className="bg-[var(--card-bg)] border border-[var(--card-border)] rounded-xl p-4">
-          <p className="text-xs font-semibold text-[var(--text-secondary)] uppercase tracking-wide mb-3">Reaction distribution by category</p>
-          <div className="space-y-2">
-            {categoryList.map(([cat, data]) => {
-              const palette = getCategoryPalette(cat);
-              const pct = Math.round((data.totalReactions / (rxnList.length || 1)) * 100);
-              return (
-                <div key={cat} className="flex items-center gap-3 cursor-pointer group"
-                  onClick={() => navigateToCategory(cat)}>
-                  <span className="text-xs text-[var(--text-secondary)] w-44 truncate group-hover:text-[var(--primary)] transition-colors" title={cat}>{cat}</span>
-                  <div className="flex-1 h-4 rounded-full bg-[var(--bg-primary)] overflow-hidden relative">
-                    <div className="h-full rounded-full transition-all"
-                      style={{ width: `${(data.totalReactions / maxCatRxns) * 100}%`, backgroundColor: palette.bg, opacity: 0.8 }} />
+        {/* 3-panel chart row: GPR donut | Compartments bar | Directionality donut */}
+        {(() => {
+          const rxns = Object.values(currentModel?.reactions || {});
+          const modelGenes = currentModel?.genes || {};
+          const total = rxns.length || 1;
+          const geneRxnSet = new Set();
+          Object.values(modelGenes).forEach(g => (g.reactions || []).forEach(rid => geneRxnSet.add(rid)));
+          const withGPR = rxns.filter(r =>
+            (r.gene_reaction_rule && r.gene_reaction_rule.trim()) ||
+            (r.gpr && r.gpr.trim()) ||
+            geneRxnSet.has(r.id)
+          ).length;
+          const exchangeCount = rxns.filter(r => r.id?.startsWith('EX_') || (r.lower_bound < 0 && Object.keys(r.metabolites || {}).length === 1)).length;
+          const spontaneous = rxns.filter(r => {
+            const hasGPR = (r.gene_reaction_rule && r.gene_reaction_rule.trim()) || (r.gpr && r.gpr.trim()) || geneRxnSet.has(r.id);
+            return !hasGPR && !(r.id?.startsWith('EX_'));
+          }).length;
+
+          // Directionality
+          const reversible = rxns.filter(r => (r.lower_bound ?? -1000) < 0 && (r.upper_bound ?? 1000) > 0).length;
+          const irreversible = total - reversible;
+
+          // Compartment breakdown
+          const compartmentCounts = {};
+          Object.keys(currentModel?.metabolites || {}).forEach(mid => {
+            const parts = mid.split('_');
+            const comp = parts[parts.length - 1] || '?';
+            compartmentCounts[comp] = (compartmentCounts[comp] || 0) + 1;
+          });
+          const compList = Object.entries(compartmentCounts).sort((a, b) => b[1] - a[1]);
+          const totalMets = compList.reduce((s, [, v]) => s + v, 0) || 1;
+          const COMP_COLORS = { c: '#3b82f6', e: '#10b981', p: '#f59e0b', m: '#8b5cf6', x: '#ef4444', n: '#ec4899' };
+          const COMP_NAMES  = { c: 'Cytoplasm', e: 'Extracellular', p: 'Periplasm', m: 'Mitochondria', x: 'Peroxisome', n: 'Nucleus' };
+          const compColors  = compList.map(([comp], i) => COMP_COLORS[comp] || `hsl(${(i * 53) % 360},38%,52%)`);
+
+          // GPR donut data
+          const gprData = [
+            { label: 'Gene-associated',      value: withGPR,       color: 'var(--primary)' },
+            { label: 'Spontaneous/transport', value: spontaneous,   color: 'var(--border-color)' },
+            { label: 'Exchange/demand',       value: exchangeCount, color: '#94a3b8' },
+          ].filter(d => d.value > 0);
+
+          // Directionality donut data
+          const dirData = [
+            { label: 'Reversible',   value: reversible,   color: '#3b82f6' },
+            { label: 'Irreversible', value: irreversible, color: '#64748b' },
+          ].filter(d => d.value > 0);
+
+          const panelStyle = { background: 'var(--bg-secondary)', border: '1px solid var(--border-color)', borderRadius: 3 };
+
+          return (
+            <div className="grid grid-cols-3 gap-3">
+              {/* Panel 1 — GPR Coverage donut */}
+              <div className="p-4 flex flex-col" style={panelStyle}>
+                <p className="text-[10px] font-medium uppercase tracking-widest mb-3" style={{ color: 'var(--text-muted)' }}>GPR Coverage</p>
+                <div className="flex items-center gap-4">
+                  <DonutChart data={gprData} total={total} size={108} centerValue={`${Math.round((withGPR/total)*100)}%`} centerLabel="GPR" />
+                  <div className="flex flex-col gap-2 min-w-0">
+                    {gprData.map(d => (
+                      <div key={d.label} className="flex items-center gap-1.5 min-w-0">
+                        <span style={{ width: 8, height: 8, borderRadius: 1, background: d.color, flexShrink: 0, display: 'inline-block' }} />
+                        <span className="text-[10px] truncate" style={{ color: 'var(--text-secondary)' }}>{d.label}</span>
+                        <span className="text-[10px] ml-auto pl-1 font-mono" style={{ color: 'var(--text-muted)', flexShrink: 0 }}>{d.value}</span>
+                      </div>
+                    ))}
                   </div>
-                  <span className="text-xs font-mono text-[var(--text-muted)] w-24 text-right">{data.totalReactions.toLocaleString()} rxns ({pct}%)</span>
                 </div>
-              );
-            })}
-          </div>
-        </div>
+              </div>
+
+              {/* Panel 2 — Compartment proportional bar */}
+              <div className="p-4 flex flex-col" style={panelStyle}>
+                <p className="text-[10px] font-medium uppercase tracking-widest mb-3" style={{ color: 'var(--text-muted)' }}>Metabolite Compartments</p>
+                {/* Stacked bar */}
+                <div className="flex h-5 overflow-hidden mb-3" style={{ borderRadius: 2 }}>
+                  {compList.map(([comp, count], i) => (
+                    <div key={comp} style={{ width: `${(count / totalMets) * 100}%`, background: compColors[i], flexShrink: 0 }} title={`${COMP_NAMES[comp] || comp}: ${count}`} />
+                  ))}
+                </div>
+                <div className="space-y-1.5 flex-1">
+                  {compList.map(([comp, count], i) => (
+                    <div key={comp} className="flex items-center gap-1.5">
+                      <span style={{ width: 8, height: 8, borderRadius: 1, background: compColors[i], flexShrink: 0, display: 'inline-block' }} />
+                      <code className="text-[10px]" style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-muted)' }}>[{comp}]</code>
+                      <span className="text-[10px]" style={{ color: 'var(--text-secondary)' }}>{COMP_NAMES[comp] || comp.toUpperCase()}</span>
+                      <span className="text-[10px] ml-auto font-mono" style={{ color: 'var(--text-muted)' }}>{count}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Panel 3 — Reaction Directionality donut */}
+              <div className="p-4 flex flex-col" style={panelStyle}>
+                <p className="text-[10px] font-medium uppercase tracking-widest mb-3" style={{ color: 'var(--text-muted)' }}>Reaction Directionality</p>
+                <div className="flex items-center gap-4">
+                  <DonutChart data={dirData} total={total} size={108} centerValue={`${Math.round((reversible/total)*100)}%`} centerLabel="rev." />
+                  <div className="flex flex-col gap-2 min-w-0">
+                    {dirData.map(d => (
+                      <div key={d.label} className="flex items-center gap-1.5 min-w-0">
+                        <span style={{ width: 8, height: 8, borderRadius: 1, background: d.color, flexShrink: 0, display: 'inline-block' }} />
+                        <span className="text-[10px] truncate" style={{ color: 'var(--text-secondary)' }}>{d.label}</span>
+                        <span className="text-[10px] ml-auto pl-1 font-mono" style={{ color: 'var(--text-muted)', flexShrink: 0 }}>{d.value}</span>
+                      </div>
+                    ))}
+                    <p className="text-[10px] mt-1" style={{ color: 'var(--text-muted)' }}>
+                      lb &lt; 0 &amp;&amp; ub &gt; 0 → reversible
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
       </div>
     );
   };
+
+  const renderDashboardFooter = () => (
+    <footer className="mx-4 mt-2 mb-3 pt-4" style={{ borderTop: '1px solid var(--border-color)' }}>
+      <div className="grid grid-cols-3 gap-6 mb-4">
+        <div>
+          <p className="text-[10px] font-medium uppercase tracking-widest mb-2" style={{ color: 'var(--text-muted)' }}>Supported Formats</p>
+          <ul className="space-y-1">
+            {['SBML Level 2 / Level 3', 'SBML FBC v2 (flux bounds, GPR)', 'SBML Groups (subsystems)', 'SBML Layout (coordinates)', 'JSON — CobraPy / BIGG Models'].map(f => (
+              <li key={f} className="text-[11px]" style={{ color: 'var(--text-secondary)' }}>{f}</li>
+            ))}
+          </ul>
+        </div>
+        <div>
+          <p className="text-[10px] font-medium uppercase tracking-widest mb-2" style={{ color: 'var(--text-muted)' }}>Model Databases</p>
+          <ul className="space-y-1">
+            {['BIGG Models (bigg.ucsd.edu)', 'BioModels (ebi.ac.uk/biomodels)', 'MetaNetX (metanetx.org)', 'BioCyc / EcoCyc (biocyc.org)', 'KEGG (genome.jp/kegg)'].map(d => (
+              <li key={d} className="text-[11px]" style={{ color: 'var(--text-secondary)' }}>{d}</li>
+            ))}
+          </ul>
+        </div>
+        <div>
+          <p className="text-[10px] font-medium uppercase tracking-widest mb-2" style={{ color: 'var(--text-muted)' }}>Analysis Methods</p>
+          <ul className="space-y-1">
+            {['FBA — Flux Balance Analysis', 'pFBA — Parsimonious FBA', 'FVA — Flux Variability Analysis', 'MOMA — Minimization of Metabolic Adjustment', 'Gene Knockout Simulation'].map(a => (
+              <li key={a} className="text-[11px]" style={{ color: 'var(--text-secondary)' }}>{a}</li>
+            ))}
+          </ul>
+        </div>
+      </div>
+      <div className="flex items-center justify-between pt-3" style={{ borderTop: '1px solid var(--border-color)' }}>
+        <span className="text-[10px]" style={{ color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+          MetaboViz v0.1.0 — browser-native constraint-based modelling
+        </span>
+        <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
+          © 2026 MetaboViz. For research and educational use.
+        </span>
+      </div>
+    </footer>
+  );
 
   // Squarified treemap helpers
   const buildTreemapRects = useCallback(() => {
@@ -595,14 +764,17 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
 
     return (
       <div className="px-4 pb-4">
-        <div className="bg-[var(--card-bg)] border border-[var(--card-border)] rounded-xl p-4">
+        <div className="p-4" style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-color)', borderRadius: 3 }}>
           <div className="flex items-center justify-between mb-3">
-            <p className="text-xs font-semibold text-[var(--text-secondary)] uppercase tracking-wide">
-              Subsystem Treemap — click any block to navigate
+            <p className="text-[10px] font-medium uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>
+              Subsystem treemap — click to navigate
             </p>
             <button
               onClick={downloadTreemapSVG}
-              className="flex items-center gap-1.5 px-3 py-1 text-xs rounded-lg border border-[var(--border-color)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)] transition-colors"
+              className="flex items-center gap-1.5 px-3 py-1 text-xs transition-colors"
+              style={{ border: '1px solid var(--border-color)', borderRadius: 2, color: 'var(--text-secondary)', background: 'transparent' }}
+              onMouseEnter={e => e.currentTarget.style.color = 'var(--text-primary)'}
+              onMouseLeave={e => e.currentTarget.style.color = 'var(--text-secondary)'}
             >
               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
@@ -684,62 +856,69 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
     );
   };
 
-  // Render category cards (top level)
+  // Render compact category table (top level)
   const renderCategoryCards = () => {
     const categoryList = Array.from(categoryHierarchy.entries())
       .sort((a, b) => b[1].totalReactions - a[1].totalReactions);
     const totalRxns = categoryList.reduce((s, [, d]) => s + d.totalReactions, 0) || 1;
+    const maxRxns   = categoryList[0]?.[1].totalReactions || 1;
+
+    const thCls = 'px-3 py-2 text-[10px] font-bold text-[var(--text-muted)] uppercase tracking-widest text-left select-none bg-[var(--bg-secondary)] border-b border-[var(--border-color)]';
 
     return (
-      <div className="p-4 space-y-3">
-        <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-3">
-          {categoryList.map(([category, data]) => {
-            const palette = getCategoryPalette(category);
-            const icon = CATEGORY_ICONS[category] || '📦';
-            const pct = Math.round((data.totalReactions / totalRxns) * 100);
-            return (
-              <button
-                key={category}
-                onClick={() => navigateToCategory(category)}
-                className="group text-left rounded-xl border-2 overflow-hidden transition-all hover:shadow-lg hover:-translate-y-0.5"
-                style={{ borderColor: isDark ? '#374151' : palette.border }}
-              >
-                {/* Colored header strip */}
-                <div className="px-4 pt-4 pb-3" style={{ backgroundColor: isDark ? '#1f2937' : palette.light }}>
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-2xl">{icon}</span>
-                    <span
-                      className="text-xs font-bold px-2 py-0.5 rounded-full text-white"
-                      style={{ backgroundColor: palette.bg }}
-                    >
-                      {data.subsystems.length} subsystem{data.subsystems.length !== 1 ? 's' : ''}
+      <div className="overflow-auto">
+        <table className="w-full border-collapse text-sm">
+          <thead>
+            <tr>
+              <th className={`${thCls} w-8`}>#</th>
+              <th className={thCls}>Category</th>
+              <th className={`${thCls} text-right w-20`}>Reactions</th>
+              <th className={`${thCls} w-52`}>Distribution</th>
+              <th className={`${thCls} text-right w-12`}>%</th>
+              <th className={`${thCls} text-right w-20`}>Metabolites</th>
+              <th className={`${thCls} text-right w-24`}>Subsystems</th>
+            </tr>
+          </thead>
+          <tbody>
+            {categoryList.map(([category, data], idx) => {
+              const palette = getCategoryPalette(category);
+              const icon    = CATEGORY_ICONS[category] || '📦';
+              const pct     = Math.round((data.totalReactions / totalRxns) * 100);
+              const barW    = Math.round((data.totalReactions / maxRxns) * 100);
+              return (
+                <tr key={category}
+                  onClick={() => navigateToCategory(category)}
+                  className="border-b border-[var(--border-color)] hover:bg-[var(--bg-primary)] cursor-pointer group transition-colors">
+                  <td className="px-3 py-2 text-xs text-[var(--text-muted)] font-mono text-center">{idx + 1}</td>
+                  <td className="px-3 py-2">
+                    <div className="flex items-center gap-2">
+                      <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: palette.bg }} />
+                      <span className="text-base leading-none">{icon}</span>
+                      <span className="font-medium text-[var(--text-primary)] group-hover:underline text-sm">{category}</span>
+                    </div>
+                  </td>
+                  <td className="px-3 py-2 text-right font-mono text-xs text-[var(--text-secondary)]">
+                    {data.totalReactions.toLocaleString()}
+                  </td>
+                  <td className="px-3 py-2">
+                    <div className="w-full h-2 rounded-full overflow-hidden" style={{ background: 'var(--bg-primary)' }}>
+                      <div className="h-full rounded-full transition-all" style={{ width: `${barW}%`, backgroundColor: palette.bg, opacity: 0.75 }} />
+                    </div>
+                  </td>
+                  <td className="px-3 py-2 text-right text-xs font-mono font-bold" style={{ color: palette.bg }}>{pct}%</td>
+                  <td className="px-3 py-2 text-right font-mono text-xs text-[var(--text-muted)]">
+                    {data.totalMetabolites.size.toLocaleString()}
+                  </td>
+                  <td className="px-3 py-2 text-right">
+                    <span className="px-2 py-0.5 text-[10px] font-bold rounded text-white" style={{ backgroundColor: palette.bg }}>
+                      {data.subsystems.length}
                     </span>
-                  </div>
-                  <h4 className="font-semibold text-sm text-[var(--text-primary)] leading-tight group-hover:underline">
-                    {category}
-                  </h4>
-                </div>
-                {/* Stats section */}
-                <div className="px-4 py-3 bg-[var(--card-bg)]">
-                  <div className="flex justify-between text-xs text-[var(--text-muted)] mb-1.5">
-                    <span>{data.totalReactions.toLocaleString()} reactions</span>
-                    <span className="font-medium" style={{ color: palette.bg }}>{pct}%</span>
-                  </div>
-                  {/* Proportional bar */}
-                  <div className="w-full h-1.5 rounded-full bg-[var(--bg-primary)] overflow-hidden">
-                    <div
-                      className="h-full rounded-full transition-all"
-                      style={{ width: `${pct}%`, backgroundColor: palette.bg }}
-                    />
-                  </div>
-                  <p className="text-xs text-[var(--text-muted)] mt-2">
-                    {data.totalMetabolites.size.toLocaleString()} metabolites
-                  </p>
-                </div>
-              </button>
-            );
-          })}
-        </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
     );
   };
@@ -798,7 +977,7 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
       const r = Object.entries(rxn.metabolites || {}).filter(([,c]) => c < 0).map(([m]) => mets[m]?.name || m).join(' + ');
       const p = Object.entries(rxn.metabolites || {}).filter(([,c]) => c > 0).map(([m]) => mets[m]?.name || m).join(' + ');
       return [id, rxn.name || '', rxn.lower_bound ?? -1000, rxn.upper_bound ?? 1000,
-        rxn.gene_reaction_rule || '', rxn.subsystem || '', `${r} → ${p}`].map(esc).join(',');
+        rxn.gpr || rxn.gene_reaction_rule || '', rxn.subsystem || '', `${r} → ${p}`].map(esc).join(',');
     });
     const blob = new Blob([[header, ...lines].join('\n')], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
@@ -806,6 +985,28 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
     a.href = url; a.download = `${currentModel?.id || 'model'}_reactions.csv`; a.click();
     URL.revokeObjectURL(url);
   }, [currentModel]);
+
+  // Inline reaction editing state
+  const [editingRxnId, setEditingRxnId] = useState(null);
+  const [editDraft, setEditDraft] = useState({});
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
+  const startEdit = (row) => {
+    setEditingRxnId(row.id);
+    setEditDraft({ name: row.name, lb: row.lb, ub: row.ub, gpr: row.gpr, subsystem: row.subsystem });
+  };
+  const cancelEdit = () => { setEditingRxnId(null); setEditDraft({}); };
+  const saveEdit = () => {
+    if (!editingRxnId) return;
+    updateReactions({ [editingRxnId]: {
+      name: editDraft.name,
+      lower_bound: parseFloat(editDraft.lb) || 0,
+      upper_bound: parseFloat(editDraft.ub) || 0,
+      gene_reaction_rule: editDraft.gpr,
+      subsystem: editDraft.subsystem,
+    }});
+    cancelEdit();
+  };
 
   const [csvImportMsg, setCsvImportMsg] = useState(null);
   const handleCSVImport = useCallback(async (e) => {
@@ -873,9 +1074,9 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
       const r = Object.entries(rxn.metabolites || {}).filter(([,c]) => c < 0).map(([m]) => mets[m]?.name || m);
       const p = Object.entries(rxn.metabolites || {}).filter(([,c]) => c > 0).map(([m]) => mets[m]?.name || m);
       return { id, name: rxn.name || '', reactants: r, products: p,
-        rev: (rxn.lower_bound ?? -1000) < 0, hasGPR: !!rxn.gene_reaction_rule,
+        rev: (rxn.lower_bound ?? -1000) < 0, hasGPR: !!(rxn.gpr || rxn.gene_reaction_rule),
         lb: rxn.lower_bound ?? -1000, ub: rxn.upper_bound ?? 1000,
-        gpr: rxn.gene_reaction_rule || '', subsystem: rxn.subsystem || '' };
+        gpr: rxn.gpr || rxn.gene_reaction_rule || '', subsystem: rxn.subsystem || '' };
     });
     const qlo = reactionsQuery.toLowerCase();
     const filtered = qlo ? rows.filter(r =>
@@ -914,38 +1115,109 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
         )}
         <div className="overflow-auto">
           <table className="w-full text-sm border-collapse">
-            <thead className="bg-[var(--bg-secondary)]">
+            <thead className="bg-[var(--bg-secondary)] sticky top-0 z-10">
               <tr className="text-left text-xs text-[var(--text-muted)] border-b border-[var(--border-color)]">
                 <th className="px-3 py-2 font-medium w-36">ID</th>
                 <th className="px-3 py-2 font-medium">Stoichiometry</th>
-                <th className="px-3 py-2 font-medium w-40">Subsystem</th>
-                <th className="px-3 py-2 font-medium w-24">Bounds</th>
-                <th className="px-3 py-2 font-medium w-48">GPR</th>
+                <th className="px-3 py-2 font-medium w-36">Subsystem</th>
+                <th className="px-3 py-2 font-medium w-28">Bounds [lb, ub]</th>
+                <th className="px-3 py-2 font-medium w-44">GPR</th>
+                <th className="px-3 py-2 font-medium w-16 text-center">Edit</th>
               </tr>
             </thead>
             <tbody>
-              {filtered.map(row => (
-                <tr key={row.id}
-                  onClick={() => onReactionSelect?.(row.id)}
-                  className="border-b border-[var(--border-color)] cursor-pointer hover:bg-[var(--bg-secondary)] transition-colors">
-                  <td className="px-3 py-2">
-                    <div className="font-mono text-xs font-medium text-[var(--text-primary)]">{row.id}</div>
-                    {row.name && row.name !== row.id && <div className="text-xs text-[var(--text-muted)] truncate max-w-[130px]" title={row.name}>{row.name}</div>}
-                    <div className="flex gap-1 mt-0.5">
-                      {row.rev && <span className="px-1 text-[10px] rounded bg-amber-100 text-amber-700">rev</span>}
-                      {row.hasGPR && <span className="px-1 text-[10px] rounded bg-blue-100 text-blue-700">gpr</span>}
-                    </div>
-                  </td>
-                  <td className="px-3 py-2 font-mono text-xs text-[var(--text-secondary)]">
-                    <span className="text-red-500">{row.reactants.slice(0,3).join(' + ')}{row.reactants.length > 3 ? ` +${row.reactants.length-3}` : ''}</span>
-                    <span className="mx-1 text-[var(--text-muted)]">{row.rev ? '⇌' : '→'}</span>
-                    <span className="text-green-600">{row.products.slice(0,3).join(' + ')}{row.products.length > 3 ? ` +${row.products.length-3}` : ''}</span>
-                  </td>
-                  <td className="px-3 py-2 text-xs text-[var(--text-muted)] truncate max-w-[150px]" title={row.subsystem}>{row.subsystem || '—'}</td>
-                  <td className="px-3 py-2 font-mono text-xs text-[var(--text-muted)]">[{row.lb}, {row.ub}]</td>
-                  <td className="px-3 py-2 font-mono text-xs text-[var(--text-muted)] break-all" style={{lineHeight:1.3}}>{row.gpr || '—'}</td>
-                </tr>
-              ))}
+              {filtered.map(row => {
+                const isEditing = editingRxnId === row.id;
+                const confirming = confirmDeleteId === row.id;
+                const inCls = 'w-full text-[10px] px-1.5 py-0.5 border border-[var(--border-color)] bg-[var(--bg-primary)] text-[var(--text-primary)] font-mono focus:outline-none focus:ring-1 focus:ring-[var(--primary)]';
+                return (
+                  <tr key={row.id}
+                    className={`group border-b border-[var(--border-color)] transition-colors ${isEditing ? 'bg-blue-50 dark:bg-blue-950' : 'hover:bg-[var(--bg-secondary)] cursor-pointer'}`}
+                    onClick={!isEditing ? () => onReactionSelect?.(row.id) : undefined}>
+                    <td className="px-3 py-2" onClick={e => isEditing && e.stopPropagation()}>
+                      <div className="font-mono text-xs font-medium text-[var(--text-primary)]">{row.id}</div>
+                      {isEditing ? (
+                        <input value={editDraft.name} onChange={e => setEditDraft(d => ({ ...d, name: e.target.value }))}
+                          className={inCls} placeholder="Display name" onClick={e => e.stopPropagation()} />
+                      ) : (
+                        <>
+                          {row.name && row.name !== row.id && <div className="text-xs text-[var(--text-muted)] truncate max-w-[130px]" title={row.name}>{row.name}</div>}
+                          <div className="flex gap-1 mt-0.5">
+                            {row.rev    && <span className="px-1 text-[10px] rounded bg-amber-100 text-amber-700">rev</span>}
+                            {row.hasGPR && <span className="px-1 text-[10px] rounded bg-blue-100 text-blue-700">gpr</span>}
+                          </div>
+                        </>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 font-mono text-xs text-[var(--text-secondary)]">
+                      <span className="text-red-500">{row.reactants.slice(0,3).join(' + ')}{row.reactants.length > 3 ? ` +${row.reactants.length-3}` : ''}</span>
+                      <span className="mx-1 text-[var(--text-muted)]">{row.rev ? '⇌' : '→'}</span>
+                      <span className="text-green-600">{row.products.slice(0,3).join(' + ')}{row.products.length > 3 ? ` +${row.products.length-3}` : ''}</span>
+                    </td>
+                    <td className="px-3 py-2 text-xs text-[var(--text-muted)]" onClick={e => isEditing && e.stopPropagation()}>
+                      {isEditing ? (
+                        <input value={editDraft.subsystem} onChange={e => setEditDraft(d => ({ ...d, subsystem: e.target.value }))}
+                          className={inCls} placeholder="Subsystem" onClick={e => e.stopPropagation()} />
+                      ) : (
+                        <span className="truncate block max-w-[130px]" title={row.subsystem}>{row.subsystem || '—'}</span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 font-mono text-xs" onClick={e => isEditing && e.stopPropagation()}>
+                      {isEditing ? (
+                        <div className="flex items-center gap-1" onClick={e => e.stopPropagation()}>
+                          <input type="number" value={editDraft.lb} onChange={e => setEditDraft(d => ({ ...d, lb: e.target.value }))}
+                            className="w-16 text-[10px] px-1 py-0.5 border border-[var(--border-color)] bg-[var(--bg-primary)] font-mono focus:outline-none" title="Lower bound" />
+                          <span className="text-[var(--text-muted)]">→</span>
+                          <input type="number" value={editDraft.ub} onChange={e => setEditDraft(d => ({ ...d, ub: e.target.value }))}
+                            className="w-16 text-[10px] px-1 py-0.5 border border-[var(--border-color)] bg-[var(--bg-primary)] font-mono focus:outline-none" title="Upper bound" />
+                        </div>
+                      ) : (
+                        <span className="text-[var(--text-muted)]">[{row.lb}, {row.ub}]</span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 font-mono text-xs text-[var(--text-muted)]" onClick={e => isEditing && e.stopPropagation()}>
+                      {isEditing ? (
+                        <input value={editDraft.gpr} onChange={e => setEditDraft(d => ({ ...d, gpr: e.target.value }))}
+                          className={inCls} placeholder="gene1 and gene2" onClick={e => e.stopPropagation()} />
+                      ) : (
+                        <span className="break-all" style={{ lineHeight: 1.3 }}>{row.gpr || '—'}</span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 text-center" onClick={e => e.stopPropagation()}>
+                      {isEditing ? (
+                        <div className="flex items-center justify-center gap-1">
+                          <button onClick={saveEdit} title="Save changes"
+                            className="p-1 rounded bg-green-600 text-white hover:bg-green-700 transition-colors">
+                            <Check className="w-3 h-3" />
+                          </button>
+                          <button onClick={cancelEdit} title="Cancel"
+                            className="p-1 rounded bg-[var(--bg-primary)] text-[var(--text-muted)] border border-[var(--border-color)] hover:text-red-500 transition-colors">
+                            <XIcon className="w-3 h-3" />
+                          </button>
+                        </div>
+                      ) : confirming ? (
+                        <div className="flex items-center gap-1">
+                          <button onClick={() => { deleteReaction(row.id); setConfirmDeleteId(null); }}
+                            className="text-[9px] px-1.5 py-0.5 rounded bg-red-600 text-white font-bold hover:bg-red-700">del</button>
+                          <button onClick={() => setConfirmDeleteId(null)}
+                            className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--border-color)] text-[var(--text-muted)]">no</button>
+                        </div>
+                      ) : (
+                        <div className="flex items-center justify-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <button onClick={() => startEdit(row)} title="Edit reaction"
+                            className="p-1 rounded hover:bg-[var(--bg-primary)] text-[var(--text-muted)] hover:text-[var(--primary)] transition-colors">
+                            <Pencil className="w-3 h-3" />
+                          </button>
+                          <button onClick={() => setConfirmDeleteId(row.id)} title="Delete reaction"
+                            className="p-1 rounded hover:bg-[var(--bg-primary)] text-[var(--text-muted)] hover:text-red-500 transition-colors">
+                            <Trash2 className="w-3 h-3" />
+                          </button>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
           {filtered.length === 0 && <div className="text-center py-12 text-[var(--text-muted)] text-sm">No reactions match "{reactionsQuery}"</div>}
@@ -1021,12 +1293,13 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
     const qlo = geneQuery.toLowerCase();
     const geneRxns = {};
     Object.entries(allRxns).forEach(([rxnId, rxn]) => {
-      if (!rxn.gene_reaction_rule) return;
-      const genes = rxn.gene_reaction_rule.replace(/[()]/g, '').split(/\s+(?:and|or)\s+/i).map(g => g.trim()).filter(Boolean);
+      const rule = rxn.gpr || rxn.gene_reaction_rule;
+      if (!rule) return;
+      const genes = rule.replace(/[()]/g, '').split(/\s+(?:and|or)\s+/i).map(g => g.trim()).filter(Boolean);
       genes.forEach(g => { if (!geneRxns[g]) geneRxns[g] = []; geneRxns[g].push(rxnId); });
     });
     const rows = Object.entries(allGenes).map(([id, gene]) => ({
-      id, name: gene.name || '', rxns: geneRxns[id] || []
+      id, name: gene.product || gene.name || id, rxns: geneRxns[id] || []
     }));
     const filtered = qlo ? rows.filter(r =>
       r.id.toLowerCase().includes(qlo) || r.name.toLowerCase().includes(qlo)
@@ -1081,10 +1354,19 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
     const metCount = Object.keys(m?.metabolites || {}).length;
     const EXPORTS = [
       {
+        icon: '</>',
+        title: 'SBML Level 3 + FBC v2',
+        desc: `Exports ${rxnCount} reactions and ${metCount} metabolites as valid SBML (Level 3, FBC package). Stoichiometry, bounds, GPR associations, and subsystem annotations are preserved. Round-trips through COBRApy and libSBML.`,
+        action: () => downloadSBML(currentModel),
+        btnLabel: 'Download .xml',
+        note: 'Inline edits (bounds, GPR, subsystem) made in the Reactions tab are reflected in the export.',
+        color: '#8b5cf6',
+      },
+      {
         icon: '{}',
         title: 'Model JSON (COBRApy format)',
-        desc: `Saves all ${rxnCount} reactions including any bounds or GPR edits made via CSV import. Compatible with COBRApy, BIGG, and other tools.`,
-        action: exportModelJSON,
+        desc: `Saves all ${rxnCount} reactions including any bounds or GPR edits. Compatible with COBRApy, BIGG, and other tools. Use model.to_json() / load_json_model() in COBRApy.`,
+        action: () => downloadJSON(currentModel),
         btnLabel: 'Download .json',
         note: null,
         color: '#3b82f6',
@@ -1224,6 +1506,7 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
           {viewLevel === 'categories' && renderModelDashboard()}
           {viewLevel === 'categories' && renderTreemap()}
           {viewLevel === 'categories' && renderCategoryCards()}
+          {viewLevel === 'categories' && renderDashboardFooter()}
           {viewLevel === 'subsystems' && renderSubsystemList()}
 
           {viewLevel === 'reactions' && (
@@ -1260,11 +1543,6 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
       {activeTab === 'reactions'   && renderReactionsTab()}
       {activeTab === 'metabolites' && renderMetabolitesTab()}
       {activeTab === 'genes'       && renderGenesTab()}
-      {activeTab === 'maps'        && (
-        <div className="flex-1 flex flex-col overflow-hidden" style={{ height: height - 48 }}>
-          <EscherMapView fluxes={fluxes} phenotype={phenotype} />
-        </div>
-      )}
       {activeTab === 'export'      && renderExportTab()}
     </div>
   );

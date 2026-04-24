@@ -17,7 +17,14 @@
  * @module HiGHSSolver
  */
 
-import { evaluateGPR as evaluateGPRBoolean, gprToReactionExpression } from './GPRExpression.js';
+import {
+  findObjectiveReaction as findObjRxn,
+  evaluateGPRQuantitative,
+  buildSplitVarProblem,
+  formatSplitResult as formatSplitResultShared,
+  SOLVER_TOLERANCE,
+  DEFAULT_VIABILITY_THRESHOLD,
+} from './MetabolicLP.js';
 
 // Solver status codes
 export const SolverStatus = {
@@ -692,152 +699,23 @@ class HiGHSSolverClass {
     return result;
   }
 
-  /**
-   * Build metabolic LP problem with split variables for absolute values
-   */
+  /** Delegates to MetabolicLP.buildSplitVarProblem (shared with SolverWorker) */
   buildMetabolicProblem(model, constraints = {}, knockouts = []) {
-    const reactions = Object.entries(model.reactions || {});
-    const metabolites = Object.entries(model.metabolites || {});
-
-    const problem = {
-      sense: 'max',
-      objective: [],
-      constraints: [],
-      variables: [],
-    };
-
-    const rxnVars = [];
-
-    // Create split variables for each reaction: v = v_pos - v_neg
-    reactions.forEach(([rxnId, rxn]) => {
-      rxnVars.push(rxnId);
-
-      let lb = rxn.lower_bound ?? -1000;
-      let ub = rxn.upper_bound ?? 1000;
-
-      // Apply custom constraints
-      if (constraints[rxnId]) {
-        if (constraints[rxnId].lb !== undefined) lb = constraints[rxnId].lb;
-        if (constraints[rxnId].ub !== undefined) ub = constraints[rxnId].ub;
-      }
-
-      // Apply knockouts via proper Boolean GPR evaluation
-      // Uses recursive descent parser from GPRExpression.js (Orth et al. 2010)
-      // For OR (isozyme) logic: knockout of one gene does NOT disable reaction
-      // For AND (complex) logic: knockout of any subunit disables reaction
-      if (knockouts.length > 0 && (rxn.gpr || rxn.gene_reaction_rule)) {
-        const gprString = rxn.gpr || rxn.gene_reaction_rule;
-        // Build active gene set: all genes in model minus knocked-out genes
-        const knockoutSet = new Set(knockouts.map(g => g.toLowerCase()));
-        // Extract genes from this GPR and build active set
-        const gprGenes = (gprString.match(/[a-zA-Z][a-zA-Z0-9_.-]*/g) || [])
-          .filter(g => !['and', 'or', 'AND', 'OR'].includes(g));
-        const activeGenes = new Set(
-          gprGenes.filter(g => !knockoutSet.has(g.toLowerCase()))
-        );
-        const isActive = evaluateGPRBoolean(gprString, activeGenes);
-        if (!isActive) {
-          lb = 0;
-          ub = 0;
-        }
-      }
-
-      // v_pos (positive flux component)
-      problem.variables.push({
-        name: `v_${rxnId}_pos`,
-        lb: Math.max(0, lb),
-        ub: Math.max(0, ub),
-        type: 'continuous',
-      });
-
-      // v_neg (negative flux component)
-      problem.variables.push({
-        name: `v_${rxnId}_neg`,
-        lb: Math.max(0, -ub),
-        ub: Math.max(0, -lb),
-        type: 'continuous',
-      });
-
-      // Objective coefficient
-      if (rxn.objective_coefficient && rxn.objective_coefficient !== 0) {
-        problem.objective.push({ name: `v_${rxnId}_pos`, coef: rxn.objective_coefficient });
-        problem.objective.push({ name: `v_${rxnId}_neg`, coef: -rxn.objective_coefficient });
-      }
-    });
-
-    // If no explicit objective, look for biomass
-    if (problem.objective.length === 0) {
-      const biomassRxn = reactions.find(([id]) =>
-        id.toLowerCase().includes('biomass')
-      );
-      if (biomassRxn) {
-        problem.objective.push({ name: `v_${biomassRxn[0]}_pos`, coef: 1 });
-        problem.objective.push({ name: `v_${biomassRxn[0]}_neg`, coef: -1 });
-      }
-    }
-
-    // Mass balance constraints: Sv = 0
-    metabolites.forEach(([metId]) => {
-      const terms = [];
-
-      reactions.forEach(([rxnId, rxn]) => {
-        const coef = rxn.metabolites?.[metId];
-        if (coef) {
-          terms.push({ name: `v_${rxnId}_pos`, coef });
-          terms.push({ name: `v_${rxnId}_neg`, coef: -coef });
-        }
-      });
-
-      if (terms.length > 0) {
-        problem.constraints.push({
-          name: `mb_${metId}`,
-          lhs: terms,
-          type: 'eq',
-          rhs: 0,
-        });
-      }
-    });
-
-    return { problem, rxnVars };
+    return buildSplitVarProblem(model, constraints, knockouts);
   }
 
-  /**
-   * Find the objective reaction in a model
-   */
+  /** Delegates to MetabolicLP.findObjectiveReaction */
   findObjectiveReaction(model) {
-    for (const [rxnId, rxn] of Object.entries(model.reactions || {})) {
-      if (rxn.objective_coefficient && rxn.objective_coefficient !== 0) {
-        return rxnId;
-      }
-    }
-    return Object.keys(model.reactions || {}).find(id =>
-      id.toLowerCase().includes('biomass')
-    );
+    return findObjRxn(model);
   }
 
   /**
-   * Evaluate GPR expression to get reaction expression level.
-   * Delegates to the canonical recursive descent parser in GPRExpression.js.
-   *
-   * AND → min (enzyme complex: Liebig's law of the minimum)
-   * OR  → max (isozymes: highest expressed dominates)
-   *
-   * @param {string} gpr - GPR rule string
-   * @param {Map|Object} expressionData - Gene expression levels
-   * @returns {number} Reaction expression level
+   * Quantitative GPR evaluation for omics integration.
+   * AND → min (Liebig's law), OR → max (isozyme dominance).
+   * Delegates to MetabolicLP.evaluateGPRQuantitative.
    */
   evaluateGPR(gpr, expressionData) {
-    if (!gpr || !gpr.trim()) return 1.0;
-
-    // Normalize expressionData to Map for GPRExpression.js
-    let exprMap;
-    if (expressionData instanceof Map) {
-      exprMap = expressionData;
-    } else {
-      exprMap = new Map(Object.entries(expressionData));
-    }
-
-    return gprToReactionExpression(gpr, exprMap);
+    return evaluateGPRQuantitative(gpr, expressionData);
   }
 
   /**

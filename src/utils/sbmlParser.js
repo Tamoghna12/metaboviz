@@ -67,6 +67,23 @@ export const parseSBML = (xmlString) => {
   // Parse reactions (passing parameterLookup for FBC bound resolution)
   const { reactions, genes } = parseReactions(modelElement, species, geneProducts, level, parameterLookup);
 
+  // Include all genes defined in listOfGeneProducts, not just those linked to reaction GPRs.
+  // COBRApy counts all geneProduct entries; we were only counting genes appearing in reactions.
+  // geneProducts is dual-indexed (raw id AND label), so deduplicate by raw id.
+  const _seenGpIds = new Set();
+  Object.values(geneProducts).forEach(gp => {
+    if (_seenGpIds.has(gp.id)) return;
+    _seenGpIds.add(gp.id);
+    const labelId = gp.label || gp.id;
+    if (!genes[labelId]) {
+      genes[labelId] = {
+        product: gp.name || gp.label || gp.id,
+        essential: false,
+        subsystem: 'Unknown'
+      };
+    }
+  });
+
   // Parse layout information if available
   const layoutInfo = parseLayout(modelElement);
 
@@ -199,11 +216,11 @@ const parseGeneProducts = (modelElement) => {
       const label = gp.getAttribute('label') || gp.getAttributeNS(SBML_NS.fbc, 'label') || id;
       const name = gp.getAttribute('name') || gp.getAttributeNS(SBML_NS.fbc, 'name') || label;
 
-      geneProducts[id] = {
-        id,
-        label,
-        name
-      };
+      const entry = { id, label, name };
+      geneProducts[id] = entry;
+      // Also index by label so lookups by label (post-GPR-mapping) resolve correctly.
+      // COBRApy strips the G_ prefix and uses the label as gene.id.
+      if (label && label !== id) geneProducts[label] = entry;
     });
   }
 
@@ -409,7 +426,19 @@ const parseGPR = (rxnElement, geneProducts, level) => {
     return gp?.label || g;
   });
 
-  return { gpr, geneList: [...new Set(mappedGeneList)] };
+  // Remap the gpr string to use labels, matching COBRApy convention.
+  // SBML FBC stores IDs like "G_b0001" but COBRApy exposes "b0001".
+  // Without this, knockout checks always fail for SBML models.
+  let mappedGpr = gpr;
+  geneList.forEach((rawId, i) => {
+    const label = mappedGeneList[i];
+    if (label !== rawId) {
+      const escaped = rawId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      mappedGpr = mappedGpr.replace(new RegExp(escaped, 'g'), label);
+    }
+  });
+
+  return { gpr: mappedGpr, geneList: [...new Set(mappedGeneList)] };
 };
 
 /**

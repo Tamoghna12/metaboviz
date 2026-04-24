@@ -1,0 +1,36 @@
+{
+  "meta": {
+    "tier": "kernel",
+    "note": "model loaded once; times are solve-only"
+  },
+  "results": {
+    "e_coli_core": {
+      "reactions": 95,
+      "load_ms": 19.1,
+      "fba_ms": 0.44,
+      "pfba_ms": 3.23,
+      "fva_ms": 18.7
+    },
+    "iJR904": {
+      "reactions": 1075,
+      "load_ms": 269.8,
+      "fba_ms": 3.39,
+      "pfba_ms": 34.1,
+      "fva_ms": 2286.0
+    },
+    "iJO1366": {
+      "reactions": 2583,
+      "load_ms": 785.0,
+      "fba_ms": 8.13,
+      "pfba_ms": 97.16,
+      "fva_ms": 12472.0
+    },
+    "iCHOv1_DG44": {
+      "reactions": 3942,
+      "load_ms": 1141.1,
+      "fba_ms": 14.73,
+      "pfba_ms": 341.94,
+      "fva_ms": 35537.3
+    }
+  }
+}

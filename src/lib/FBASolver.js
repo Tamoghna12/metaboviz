@@ -129,9 +129,10 @@ export async function solveFBA(model, options = {}) {
     return { status: 'NO_REACTIONS', objectiveValue: 0, fluxes: {} };
   }
 
-  // Determine active genes (all genes minus knockouts)
+  // Determine active genes — case-insensitive knockout matching
   const allGenes = extractAllGenes(model);
-  const activeGenes = new Set([...allGenes].filter(g => !knockoutGenes.has(g)));
+  const knockoutLower = new Set([...knockoutGenes].map(g => g.toLowerCase()));
+  const activeGenes = new Set([...allGenes].filter(g => !knockoutLower.has(g.toLowerCase())));
 
   // Build LP problem
   const problem = {
@@ -239,10 +240,23 @@ export async function solveFBA(model, options = {}) {
       }
     }
 
+    // Extract shadow prices (dual variables for mass-balance constraints)
+    // Shadow price of metabolite i = ∂Z/∂b_i: marginal value of relaxing S_i·v=0
+    const shadowPrices = {};
+    if (result.result?.dual) {
+      Object.entries(result.result.dual).forEach(([constraintName, dualValue]) => {
+        if (constraintName.startsWith('mass_balance_')) {
+          const metId = constraintName.slice('mass_balance_'.length);
+          shadowPrices[metId] = dualValue;
+        }
+      });
+    }
+
     return {
       status,
       objectiveValue: result.result?.z ?? 0,
       fluxes,
+      shadowPrices,
       objective,
       knockedOutGenes: Array.from(knockoutGenes),
       solverInfo: {

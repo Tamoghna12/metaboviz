@@ -4,7 +4,7 @@
  * Provides offline support and caching for the web application.
  */
 
-const CACHE_NAME = 'metabolicsuite-v1';
+const CACHE_NAME = 'metabolicsuite-v2';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
@@ -43,6 +43,14 @@ self.addEventListener('fetch', (event) => {
   // Skip API calls and external resources
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return;
+
+  // Never serve JS/TS modules from cache — always fetch fresh to avoid MIME poisoning
+  const pathname = new URL(event.request.url).pathname;
+  const isModule = /\.(js|jsx|ts|tsx|mjs)(\?.*)?$/.test(pathname) || pathname.startsWith('/@');
+  if (isModule) {
+    event.respondWith(fetch(event.request));
+    return;
+  }
 
   event.respondWith(
     caches.match(event.request).then((cachedResponse) => {

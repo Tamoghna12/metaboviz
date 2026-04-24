@@ -16,6 +16,7 @@
  */
 
 import { backendService } from './BackendService';
+import { kernelSolver } from './KernelSolver';
 
 // Algorithm registry - maps method names to solver implementations
 const ALGORITHM_REGISTRY = new Map();
@@ -51,6 +52,24 @@ class ComputeManager {
     this.pendingJobs = new Map();
     this.jobCounter = 0;
     this.backendAvailable = null;
+    // Pyodide tier (browser Python — loads in background)
+    this.pyWorker = null;
+    this.pyodideReady = false;
+    this.pyodideStatus = 'idle';   // 'idle'|'loading'|'ready'|'error'
+    this.pyPending = new Map();
+    this._pyStatusListeners = new Set();
+  }
+
+  /** Subscribe to Pyodide status changes. Returns unsubscribe fn. */
+  onPyodideStatus(fn) {
+    this._pyStatusListeners.add(fn);
+    fn(this.pyodideStatus);
+    return () => this._pyStatusListeners.delete(fn);
+  }
+
+  _setPyStatus(status, msg = '') {
+    this.pyodideStatus = status;
+    this._pyStatusListeners.forEach(fn => { try { fn(status, msg); } catch {} });
   }
 
   /**
@@ -92,7 +111,59 @@ class ComputeManager {
       }
     }
 
+    // Start Pyodide worker in background — doesn't block HiGHS WASM init
+    this._initPyodide();
+
     return this;
+  }
+
+  /**
+   * Start Pyodide worker without blocking the main init.
+   * On first load Pyodide fetches ~30 MB from CDN; subsequent loads are cached.
+   */
+  _initPyodide() {
+    if (this.pyWorker || typeof Worker === 'undefined') return;
+    try {
+      this._setPyStatus('loading', 'Fetching Pyodide…');
+      this.pyWorker = new Worker(
+        new URL('./PyodideWorker.js', import.meta.url),
+        { type: 'module' },
+      );
+      this.pyWorker.onmessage = e => this._handlePyMessage(e);
+      this.pyWorker.onerror   = err => {
+        console.warn('PyodideWorker error:', err);
+        this._setPyStatus('error', err.message);
+        this.pyodideReady = false;
+      };
+    } catch (err) {
+      console.warn('Cannot start PyodideWorker:', err);
+      this._setPyStatus('error', err.message);
+    }
+  }
+
+  _handlePyMessage(event) {
+    const { jobId, type, result, error, message } = event.data;
+
+    if (type === 'ready') {
+      this.pyodideReady = true;
+      this._setPyStatus('ready', 'Pyodide ready');
+      return;
+    }
+    if (type === 'loading') {
+      this._setPyStatus('loading', message || 'Loading…');
+      return;
+    }
+    if (type === 'error' && !jobId) {
+      this._setPyStatus('error', error);
+      return;
+    }
+
+    const job = this.pyPending.get(jobId);
+    if (!job) return;
+    this.pyPending.delete(jobId);
+
+    if (type === 'error') job.reject(new Error(error));
+    else job.resolve(result);
   }
 
   /**
@@ -100,6 +171,9 @@ class ComputeManager {
    */
   handleWorkerMessage(event) {
     const { jobId, type, result, error, progress } = event.data;
+
+    // 'ready' is handled by the one-shot listener in initialize()
+    if (type === 'ready') return;
 
     if (type === 'progress' && this.pendingJobs.has(jobId)) {
       const job = this.pendingJobs.get(jobId);
@@ -142,86 +216,109 @@ class ComputeManager {
   }
 
   /**
-   * Execute a computation
-   *
-   * @param {string} method - Algorithm name
-   * @param {Object} model - Metabolic model
-   * @param {Object} options - Algorithm-specific options
-   * @returns {Promise<Object>} Computation result
+   * Execute a computation — routes to the best available tier.
    */
   async solve(method, model, options = {}) {
-    // Determine best execution strategy
     const strategy = this.selectStrategy(method, model, options);
 
     switch (strategy) {
-      case 'backend':
-        return this.solveViaBackend(method, model, options);
-      case 'worker':
-        return this.solveViaWorker(method, model, options);
+      case 'kernel':  return this.solveViaKernel(method, model, options);
+      case 'worker':  return this.solveViaWorker(method, model, options);
+      case 'pyodide': return this.solveViaPyodide(method, model, options);
+      case 'backend': return this.solveViaBackend(method, model, options);
       case 'main':
-      default:
-        return this.solveOnMainThread(method, model, options);
+      default:        return this.solveOnMainThread(method, model, options);
     }
   }
 
   /**
-   * Select execution strategy based on method and model size
+   * Solve via local Python kernel (Tier 2).
+   * Falls back to worker if kernel disconnects mid-call.
+   */
+  async solveViaKernel(method, model, options) {
+    try {
+      const result = await kernelSolver.solve(
+        method,
+        model,
+        options,
+        options.onProgress || null,
+      );
+      result._tier = 'kernel';
+      return result;
+    } catch (err) {
+      console.warn('Kernel solve failed, falling back to worker:', err.message);
+      if (this.workerReady) return this.solveViaWorker(method, model, options);
+      throw err;
+    }
+  }
+
+  /**
+   * Solve via Pyodide (browser Python + scipy HiGHS).
+   * Falls back to main thread if Pyodide worker crashes.
+   */
+  async solveViaPyodide(method, model, options) {
+    if (!this.pyodideReady || !this.pyWorker) {
+      throw new Error('Pyodide not ready');
+    }
+
+    const jobId = ++this.jobCounter;
+
+    return new Promise((resolve, reject) => {
+      this.pyPending.set(jobId, { resolve, reject });
+
+      this.pyWorker.postMessage({ jobId, method, model, options });
+
+      setTimeout(() => {
+        if (this.pyPending.has(jobId)) {
+          this.pyPending.delete(jobId);
+          reject(new Error('Pyodide computation timed out'));
+        }
+      }, 600_000); // 10 min — FVA on large models can be slow
+    });
+  }
+
+  /** Expose kernel solver so components can subscribe to status changes */
+  get kernelSolver() {
+    return kernelSolver;
+  }
+
+  /** Current active tier name for display */
+  get activeTier() {
+    if (kernelSolver.isConnected) return 'kernel';
+    if (this.workerReady)         return 'wasm';
+    if (this.pyodideReady)        return 'pyodide';
+    if (this.backendAvailable)    return 'edge';
+    return 'main';
+  }
+
+  /**
+   * Select execution strategy — four-tier routing.
    *
-   * Strategy priority:
-   * 1. HiGHS WASM worker - supports true MILP, no network latency
-   * 2. Python backend - for very large models or when worker unavailable
-   * 3. Main thread - fallback for small models only
+   * Tier 1 — HiGHS WASM Worker (always available, no install, fastest)
+   * Tier 2 — Pyodide scipy-HiGHS (browser Python, ~30 MB CDN, loads in bg)
+   *           More reliable than LP-string format for genome-scale models.
+   * Tier 3 — Local Python kernel (ws://localhost:8765, optional install)
+   *           Full COBRApy access, warm-start FVA, always preferred when connected.
+   * Tier 4 — Edge backend (FastAPI)
+   * Fallback — Main thread GLPK
    */
   selectStrategy(method, model, options) {
-    const numReactions = Object.keys(model.reactions || {}).length;
-    const isMILPMethod = ['imat', 'gimme'].includes(method);
-    const isExpensiveMethod = ['fva', 'moma'].includes(method);
+    const pyodideOnly = ['fba', 'pfba', 'fva', 'moma'].includes(method);
+    const n = Object.keys(model.reactions || {}).length;
 
-    // Very large models (>3000 reactions) - prefer backend if available
-    // Backend uses optimized COBRApy/Gurobi which handles genome-scale better
-    if (numReactions > 3000 && this.backendAvailable) {
-      return 'backend';
-    }
+    // Kernel beats everything when connected — native COBRApy, no size limits
+    if (kernelSolver.isConnected) return 'kernel';
 
-    // MILP methods: HiGHS WASM now supports true MILP
-    // Prefer worker for models up to ~1500 reactions (HiGHS handles well)
-    // Fall back to backend for larger MILP problems
-    if (isMILPMethod) {
-      if (this.workerReady && numReactions <= 1500) {
-        return 'worker';
-      }
-      if (this.backendAvailable) {
-        return 'backend';
-      }
-      // No backend available - try worker anyway
-      if (this.workerReady) {
-        return 'worker';
-      }
-    }
+    // HiGHS WASM: fast, works for any size after the log_to_console fix
+    if (this.workerReady) return 'worker';
 
-    // FVA: computationally expensive (2*n LP solves)
-    // Prefer worker for small-medium, backend for large
-    if (method === 'fva') {
-      if (numReactions > 1000 && this.backendAvailable) {
-        return 'backend';
-      }
-      if (this.workerReady) {
-        return 'worker';
-      }
-    }
+    // Pyodide: reliable browser Python fallback (scipy directly builds LP matrix)
+    if (this.pyodideReady && pyodideOnly) return 'pyodide';
 
-    // Large models (>2000) - prefer backend for better performance
-    if (numReactions > 2000 && this.backendAvailable) {
-      return 'backend';
-    }
+    // Edge backend
+    if (this.backendAvailable) return 'backend';
 
-    // Medium models (>100) - always use worker to avoid UI blocking
-    if (numReactions > 100 && this.workerReady) {
-      return 'worker';
-    }
-
-    // Small models - worker preferred, main thread as fallback
-    return this.workerReady ? 'worker' : 'main';
+    return 'main';
   }
 
   /**
@@ -249,7 +346,7 @@ class ComputeManager {
    * Solve using Web Worker
    */
   async solveViaWorker(method, model, options) {
-    if (!this.workerReady) {
+    if (!this.workerReady || !this.worker) {
       throw new Error('Worker not ready');
     }
 

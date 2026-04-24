@@ -122,6 +122,17 @@ export const ModelProvider = ({ children }) => {
     }));
   }, []);
 
+  const deleteReaction = useCallback((rxnId) => {
+    setCurrentModel(prev => {
+      const { [rxnId]: _removed, ...remaining } = prev.reactions || {};
+      return { ...prev, reactions: remaining };
+    });
+  }, []);
+
+  const patchModel = useCallback((changes) => {
+    setCurrentModel(prev => ({ ...prev, ...changes }));
+  }, []);
+
   const value = {
     currentModel,
     loading,
@@ -133,6 +144,8 @@ export const ModelProvider = ({ children }) => {
     resetToDefault,
     removeModel,
     updateReactions,
+    deleteReaction,
+    patchModel,
     modelStats,
     exchangeReactions,
     subsystems,
