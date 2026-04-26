@@ -1,0 +1,81 @@
+{
+  "meta": {
+    "tier": "edge",
+    "solver": "cobrapy-glpk",
+    "note": "wall includes HTTP serialization"
+  },
+  "results": {
+    "e_coli_core": {
+      "reactions": 95,
+      "payload_kb": 169.4,
+      "methods": {
+        "fba": {
+          "wall_ms": 20.0,
+          "solver_ms": 0.7
+        },
+        "pfba": {
+          "wall_ms": 49.0,
+          "solver_ms": 15.1
+        },
+        "fva": {
+          "wall_ms": 129.0,
+          "solver_ms": 107.1
+        }
+      }
+    },
+    "iJR904": {
+      "reactions": 1075,
+      "payload_kb": 1408.5,
+      "methods": {
+        "fba": {
+          "wall_ms": 317.0,
+          "solver_ms": 23.2
+        },
+        "pfba": {
+          "wall_ms": 585.0,
+          "solver_ms": 193.6
+        },
+        "fva": {
+          "wall_ms": 776.0,
+          "solver_ms": 378.2
+        }
+      }
+    },
+    "iJO1366": {
+      "reactions": 2583,
+      "payload_kb": 2879.3,
+      "methods": {
+        "fba": {
+          "wall_ms": 1022.0,
+          "solver_ms": 81.5
+        },
+        "pfba": {
+          "wall_ms": 1444.0,
+          "solver_ms": 494.3
+        },
+        "fva": {
+          "wall_ms": 2452.0,
+          "solver_ms": 1535.7
+        }
+      }
+    },
+    "iCHOv1_DG44": {
+      "reactions": 3942,
+      "payload_kb": 3384.4,
+      "methods": {
+        "fba": {
+          "wall_ms": 1454.0,
+          "solver_ms": 192.9
+        },
+        "pfba": {
+          "wall_ms": 2096.0,
+          "solver_ms": 825.3
+        },
+        "fva": {
+          "wall_ms": 5927.0,
+          "solver_ms": 4585.4
+        }
+      }
+    }
+  }
+}

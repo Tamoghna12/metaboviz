@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MetaboViz — Browser-Native GEM Visualizer &amp; FBA</title>
+
+    <!-- PWA Meta Tags -->
+    <meta name="description" content="Interactive metabolic pathway visualization with multi-omics integration. Visualize COBRApy models, SBML files, and overlay transcriptomics, proteomics, metabolomics data." />
+    <meta name="theme-color" content="#8b5cf6" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="MetaboViz" />
+
+    <!-- PWA Manifest -->
+    <link rel="manifest" href="/metaboviz/manifest.json" />
+
+    <!-- Icons -->
+    <link rel="icon" type="image/svg+xml" href="/metaboviz/icon.svg" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
+
+    <!-- Open Graph -->
+    <meta property="og:title" content="MetaboViz" />
+    <meta property="og:description" content="Interactive metabolic pathway visualization with multi-omics integration" />
+    <meta property="og:type" content="website" />
+
+    <!-- Preconnect for performance -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <script type="module" crossorigin src="/metaboviz/assets/index-Dyo1Obq5.js"></script>
+    <link rel="modulepreload" crossorigin href="/metaboviz/assets/react-vendor-Cgg2GOmP.js">
+    <link rel="modulepreload" crossorigin href="/metaboviz/assets/charts-C2uE4IoF.js">
+    <link rel="modulepreload" crossorigin href="/metaboviz/assets/icons-OFpeK9EU.js">
+    <link rel="stylesheet" crossorigin href="/metaboviz/assets/index-gR6ATLpe.css">
+  </head>
+  <body>
+    <div id="root">
+      <!-- Loading state while React hydrates -->
+      <div style="display: flex; align-items: center; justify-content: center; height: 100vh; font-family: system-ui, sans-serif;">
+        <div style="text-align: center;">
+          <div style="width: 48px; height: 48px; border: 3px solid #e5e7eb; border-top-color: #8b5cf6; border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 16px;"></div>
+          <p style="color: #6b7280; margin: 0;">Loading MetaboViz...</p>
+        </div>
+      </div>
+      <style>
+        @keyframes spin { to { transform: rotate(360deg); } }
+      </style>
+    </div>
+
+
+    <!-- Service Worker Registration -->
+    <script>
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js')
+            .then((registration) => {
+              console.log('SW registered:', registration.scope);
+            })
+            .catch((error) => {
+              console.log('SW registration failed:', error);
+            });
+        });
+      }
+    </script>
+  </body>
+</html>

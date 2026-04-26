@@ -1,0 +1,39 @@
+{
+  "name": "MetaboViz",
+  "short_name": "MetaboViz",
+  "description": "Browser-native genome-scale metabolic model visualizer with FBA, pathway maps, and gene knockout simulation",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#8b5cf6",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["science", "education", "productivity"],
+  "screenshots": [],
+  "share_target": {
+    "action": "/share",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "files": [
+        {
+          "name": "model",
+          "accept": ["application/xml", ".xml", ".sbml", ".json"]
+        }
+      ]
+    }
+  }
+}
