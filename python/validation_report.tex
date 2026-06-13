@@ -1,0 +1,144 @@
+\documentclass{article}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{geometry}
+\usepackage{graphicx}
+\geometry{margin=1in}
+
+\title{MetabolicSuite Solver Validation Report}
+\author{HiGHS WASM vs COBRApy/GLPK}
+\date{Generated: 2026-02-28 18:11:54}
+
+\begin{document}
+
+\maketitle
+
+\section{Executive Summary}
+
+This report validates the numerical accuracy of MetabolicSuite's HiGHS WASM solver
+against the gold-standard COBRApy implementation with GLPK.
+
+\begin{table}[h]
+\centering
+\caption{Validation Summary Statistics}
+\label{tab:summary}
+\begin{tabular}{lr}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Total Models Tested & 40 \\
+Passed & 39 \\
+Failed & 1 \\
+\textbf{Pass Rate} & \textbf{97.5\%} \\
+\midrule
+Mean |Δobj| & 3.88e-08 \\
+Max |Δobj| & 1.01e-06 \\
+Min |Δobj| & 0.00e+00 \\
+Std |Δobj| & 1.56e-07 \\
+\midrule
+Mean Flux L2 Norm & 0.00e+00 \\
+Max Flux L2 Norm & 0.00e+00 \\
+\midrule
+Mean HiGHS Solve Time & 222.7 ms \\
+Mean COBRApy Solve Time & 222.7 ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Validation Criteria}
+
+\begin{itemize}
+    \item \textbf{Pass Criterion}: |Δobj| < 10$^{-6}$ (absolute objective difference)
+    \item \textbf{Flux Tolerance}: Individual flux differences < 10$^{-4}$
+    \item \textbf{Expected Pass Rate}: ≥99\% for production-ready solver
+\end{itemize}
+
+\section{Results by Method}
+
+\subsection{FBA}
+Passed: 20/20 (100.0\%)
+
+\subsection{PFBA}
+Passed: 19/20 (95.0\%)
+
+\section{Detailed Results}
+
+\begin{table}[h]
+\centering
+\caption{Per-Model Validation Results}
+\label{tab:details}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llrrrrr}
+\toprule
+\textbf{Model} & \textbf{Method} & \textbf{HiGHS} & \textbf{COBRApy} & \textbf{|Δobj|} & \textbf{Flux L2} & \textbf{Status} \\
+\midrule
+e_coli_core & fba & 0.8739 & 0.8739 & 7.65e-11 & N/A & ✓ Pass \\
+e_coli_core & pfba & 518.4221 & 518.4221 & 2.77e-08 & N/A & ✓ Pass \\
+iIS312_Trypomastigote & fba & 53.0363 & 53.0363 & 9.81e-10 & N/A & ✓ Pass \\
+iIS312_Trypomastigote & pfba & 49504.7865 & 49504.7865 & 1.01e-06 & N/A & ✗ Fail \\
+iNF517 & fba & 0.0426 & 0.0426 & 5.29e-13 & N/A & ✓ Pass \\
+iNF517 & pfba & 35.6999 & 35.6999 & 2.91e-09 & N/A & ✓ Pass \\
+iCN718 & fba & 1.3136 & 1.3136 & 1.31e-10 & N/A & ✓ Pass \\
+iCN718 & pfba & 1764.3089 & 1764.3089 & 9.54e-08 & N/A & ✓ Pass \\
+iJR904 & fba & 0.9219 & 0.9219 & 2.48e-11 & N/A & ✓ Pass \\
+iJR904 & pfba & 587.3353 & 587.3353 & 2.76e-08 & N/A & ✓ Pass \\
+iCN900 & fba & 0.0000 & 0.0000 & N/A & N/A & ✓ Pass \\
+iCN900 & pfba & 0.0000 & 0.0000 & N/A & N/A & ✓ Pass \\
+iMM904 & fba & 0.2879 & 0.2879 & 1.98e-11 & N/A & ✓ Pass \\
+iMM904 & pfba & 338.0060 & 338.0060 & 1.52e-08 & N/A & ✓ Pass \\
+iSDY_1059 & fba & 0.9379 & 0.9379 & 9.13e-11 & N/A & ✓ Pass \\
+iSDY_1059 & pfba & 758.5862 & 758.5862 & 1.09e-08 & N/A & ✓ Pass \\
+iS_1188 & fba & 0.8571 & 0.8571 & 7.41e-11 & N/A & ✓ Pass \\
+iS_1188 & pfba & 761.5636 & 761.5636 & 6.50e-08 & N/A & ✓ Pass \\
+iECH74115_1262 & fba & 0.9825 & 0.9825 & 8.15e-11 & N/A & ✓ Pass \\
+iECH74115_1262 & pfba & 697.6707 & 697.6707 & 6.23e-08 & N/A & ✓ Pass \\
+iEC042_1314 & fba & 0.9825 & 0.9825 & 8.52e-11 & N/A & ✓ Pass \\
+iEC042_1314 & pfba & 696.8067 & 696.8067 & 1.53e-08 & N/A & ✓ Pass \\
+iUTI89_1310 & fba & 0.9825 & 0.9825 & 5.29e-11 & N/A & ✓ Pass \\
+iUTI89_1310 & pfba & 698.9543 & 698.9543 & 5.52e-08 & N/A & ✓ Pass \\
+iECS88_1305 & fba & 0.9825 & 0.9825 & 4.86e-11 & N/A & ✓ Pass \\
+iECS88_1305 & pfba & 696.8067 & 696.8067 & 1.48e-08 & N/A & ✓ Pass \\
+iECP_1309 & fba & 0.9825 & 0.9825 & 9.49e-11 & N/A & ✓ Pass \\
+iECP_1309 & pfba & 696.8067 & 696.8067 & 4.26e-08 & N/A & ✓ Pass \\
+iECDH10B_1368 & fba & 1.0375 & 1.0375 & 4.48e-11 & N/A & ✓ Pass \\
+iECDH10B_1368 & pfba & 721.5565 & 721.5565 & 1.15e-08 & N/A & ✓ Pass \\
+iEcDH1_1363 & fba & 0.9825 & 0.9825 & 2.57e-11 & N/A & ✓ Pass \\
+iEcDH1_1363 & pfba & 696.8067 & 696.8067 & 5.85e-08 & N/A & ✓ Pass \\
+iETEC_1333 & fba & 0.9825 & 0.9825 & 2.80e-11 & N/A & ✓ Pass \\
+iETEC_1333 & pfba & 696.8067 & 696.8067 & 8.13e-09 & N/A & ✓ Pass \\
+iEC1364_W & fba & 0.9854 & 0.9854 & 8.77e-11 & N/A & ✓ Pass \\
+iEC1364_W & pfba & 695.5068 & 695.5068 & 6.67e-09 & N/A & ✓ Pass \\
+iEKO11_1354 & fba & 0.9825 & 0.9825 & 8.54e-12 & N/A & ✓ Pass \\
+iEKO11_1354 & pfba & 696.8067 & 696.8067 & 1.88e-08 & N/A & ✓ Pass \\
+iJN1463 & fba & 0.5861 & 0.5861 & 5.13e-11 & N/A & ✓ Pass \\
+iJN1463 & pfba & 407.0816 & 407.0816 & 5.49e-09 & N/A & ✓ Pass \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\section{Bland-Altman Analysis}
+
+To assess agreement between HiGHS WASM and COBRApy, we performed Bland-Altman analysis:
+
+\begin{itemize}
+    \item \textbf{Mean Bias}: $\bar{d} = 3.88e-08$
+    \item \textbf{95\% Limits of Agreement}: $\bar{d} \pm 1.96\sigma = [-2.68e-07, 3.45e-07]$
+\end{itemize}
+
+\section{Conclusion}
+
+The HiGHS WASM solver achieves **97.5% concordance** with COBRApy/GLPK.
+While most models pass, some show objective differences exceeding tolerance.
+
+\textbf{Recommendation}: Investigate failing models before publication.
+
+\section{Reproducibility}
+
+\begin{itemize}
+    \item COBRApy Results: \texttt{cobrapy\_results\_*.json}
+    \item HiGHS Results: Browser benchmark (via UI)
+    \item Validation Script: \texttt{run\_validation.py}
+\end{itemize}
+
+\end{document}

@@ -24,10 +24,11 @@
  */
 
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { Layers, Zap, FlaskConical, Dna, Download, BarChart2, FileText, Pencil, Trash2, Check, X as XIcon } from 'lucide-react';
+import { Layers, Zap, FlaskConical, Dna, Download, BarChart2, FileText, Pencil, Trash2, Check, X as XIcon, Activity } from 'lucide-react';
 import { useTheme } from '../contexts/ThemeContext';
 import { useModel } from '../contexts/ModelContext';
 import { downloadJSON, downloadSBML } from '../lib/ModelExporter';
+import { compute } from '../lib/ComputeWorker';
 import NetworkCanvas from './NetworkCanvas';
 
 const TABS = [
@@ -35,8 +36,438 @@ const TABS = [
   { id: 'reactions',   label: 'Reactions',   Icon: Zap         },
   { id: 'metabolites', label: 'Metabolites', Icon: FlaskConical },
   { id: 'genes',       label: 'Genes',       Icon: Dna         },
+  { id: 'fba',         label: 'FBA',         Icon: Activity    },
   { id: 'export',      label: 'Export',      Icon: Download    },
 ];
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+function _detectObj(model) {
+  const rxns = Object.entries(model?.reactions || {});
+  for (const [id, r] of rxns) if (r.objective_coefficient) return id;
+  for (const [id, r] of rxns) for (const p of [/biomass/i, /growth/i, /^BIOMASS/i]) if (p.test(id) || p.test(r.name || '')) return id;
+  return rxns[0]?.[0] ?? null;
+}
+
+function _fmtEq(rxn, mets) {
+  const lhs = [], rhs = [];
+  Object.entries(rxn.metabolites || {}).forEach(([mId, coef]) => {
+    const name = mets?.[mId]?.name || mId;
+    const abs = Math.abs(coef);
+    const s = abs === 1 ? name : `${abs} ${name}`;
+    (coef < 0 ? lhs : rhs).push(s);
+  });
+  const arrow = (rxn.lower_bound ?? -1000) < 0 ? '⇌' : '→';
+  return `${lhs.join(' + ')} ${arrow} ${rhs.join(' + ')}`;
+}
+
+function _parseEq(str) {
+  const m = str.match(/(<->|<=>|<-->|-->?|→|⇌)/);
+  if (!m) return null;
+  const isRev = m[1].startsWith('<') || m[1] === '⇌';
+  const [lhs, rhs] = str.split(m[1]);
+  const side = (s, sign) => {
+    const out = {};
+    s.trim().split(/\s*\+\s*/).forEach(p => {
+      const pm = p.trim().match(/^([\d.]+)?\s*(.+)$/);
+      if (pm) out[pm[2].trim()] = (pm[1] ? parseFloat(pm[1]) : 1) * sign;
+    });
+    return out;
+  };
+  return { metabolites: { ...side(lhs, -1), ...side(rhs, 1) }, reversible: isRev };
+}
+
+// ── FBA Studio Tab ─────────────────────────────────────────────────────────────
+function FBAStudioTab({ onFluxUpdate }) {
+  const { currentModel, updateReactions } = useModel();
+  const { isDark } = useTheme();
+  const [objective, setObjective]     = useState(null);
+  const [method, setMethod]           = useState('fba');
+  const [running, setRunning]         = useState(false);
+  const [result, setResult]           = useState(null);
+  const [solveError, setSolveError]   = useState(null);
+  const [fluxes, setFluxes]           = useState({});
+  const [pending, setPending]         = useState({});
+  const [editing, setEditing]         = useState(null);
+  const [editVal, setEditVal]         = useState('');
+  const [filter, setFilter]           = useState('');
+  const [sortCol, setSortCol]         = useState('flux');
+  const [sortDir, setSortDir]         = useState(-1);
+  const [writeMsg, setWriteMsg]       = useState('');
+  const [density, setDensity]         = useState('normal');
+  const [visibleCols, setVisibleCols] = useState({ eq: true, lb: true, ub: true, gpr: true, sub: true });
+  const [showColMenu, setShowColMenu] = useState(false);
+  const editRef    = useRef(null);
+  const colMenuRef = useRef(null);
+
+  useEffect(() => { if (currentModel) setObjective(_detectObj(currentModel)); }, [currentModel]);
+  useEffect(() => { if (editRef.current) editRef.current.focus(); }, [editing]);
+  useEffect(() => {
+    if (!showColMenu) return;
+    const h = e => { if (colMenuRef.current && !colMenuRef.current.contains(e.target)) setShowColMenu(false); };
+    document.addEventListener('mousedown', h);
+    return () => document.removeEventListener('mousedown', h);
+  }, [showColMenu]);
+
+  const mets = currentModel?.metabolites || {};
+  const rxns = currentModel?.reactions   || {};
+
+  const rows = useMemo(() => {
+    const q = filter.toLowerCase();
+    return Object.entries(rxns)
+      .filter(([id, r]) => !q || id.toLowerCase().includes(q) || (r.name || '').toLowerCase().includes(q) || (r.subsystem || '').toLowerCase().includes(q))
+      .map(([id, rxn]) => ({
+        id, rxn,
+        lb:  pending[id]?.lb  ?? rxn.lower_bound  ?? -1000,
+        ub:  pending[id]?.ub  ?? rxn.upper_bound  ?? 1000,
+        gpr: pending[id]?.gpr ?? rxn.gpr ?? rxn.gene_reaction_rule ?? '',
+        sub: pending[id]?.subsystem ?? rxn.subsystem ?? '',
+        eq:  _fmtEq(pending[id]?.rxnPatch ? { ...rxn, ...pending[id].rxnPatch } : rxn, mets),
+        flux: fluxes[id] ?? 0,
+        dirty: !!pending[id],
+      }))
+      .sort((a, b) => {
+        if (sortCol === 'flux') return sortDir * (Math.abs(b.flux) - Math.abs(a.flux));
+        if (sortCol === 'id')   return sortDir * a.id.localeCompare(b.id);
+        if (sortCol === 'lb')   return sortDir * (a.lb - b.lb);
+        if (sortCol === 'ub')   return sortDir * (a.ub - b.ub);
+        return 0;
+      });
+  }, [rxns, mets, pending, fluxes, filter, sortCol, sortDir]);
+
+  const runFBA = async () => {
+    if (!currentModel || !objective) return;
+    setRunning(true); setSolveError(null);
+    try {
+      const res = await compute(method, currentModel, { objective });
+      setResult(res);
+      const f = res.fluxes ?? {};
+      setFluxes(f);
+      onFluxUpdate?.(f);
+    } catch (e) { setSolveError(e.message); }
+    setRunning(false);
+  };
+
+  const startEdit  = (rxnId, col, val) => { setEditing({ rxnId, col }); setEditVal(String(val)); };
+  const cancelEdit = () => { setEditing(null); setEditVal(''); };
+
+  const commitEdit = () => {
+    if (!editing) return;
+    const { rxnId, col } = editing;
+    const v = editVal.trim();
+    setPending(prev => {
+      const e = { ...prev[rxnId] };
+      if      (col === 'lb')  { const n = parseFloat(v); if (!isNaN(n)) e.lb = n; }
+      else if (col === 'ub')  { const n = parseFloat(v); if (!isNaN(n)) e.ub = n; }
+      else if (col === 'gpr') e.gpr = v;
+      else if (col === 'sub') e.subsystem = v;
+      else if (col === 'eq')  { const p = _parseEq(v); if (p) e.rxnPatch = p; }
+      return Object.keys(e).length ? { ...prev, [rxnId]: e } : (({ [rxnId]: _, ...rest }) => rest)(prev);
+    });
+    cancelEdit();
+  };
+
+  const writeToModel = () => {
+    const dirty = Object.keys(pending);
+    if (!dirty.length) return;
+    const updates = {};
+    dirty.forEach(id => {
+      const e = pending[id];
+      updates[id] = { ...rxns[id] };
+      if (e.lb !== undefined) updates[id].lower_bound = e.lb;
+      if (e.ub !== undefined) updates[id].upper_bound = e.ub;
+      if (e.gpr !== undefined) { updates[id].gpr = e.gpr; updates[id].gene_reaction_rule = e.gpr; }
+      if (e.subsystem !== undefined) updates[id].subsystem = e.subsystem;
+      if (e.rxnPatch) {
+        updates[id].metabolites = e.rxnPatch.metabolites;
+        updates[id].lower_bound = e.rxnPatch.reversible
+          ? Math.min(updates[id].lower_bound ?? -1000, 0)
+          : Math.max(updates[id].lower_bound ?? 0, 0);
+      }
+    });
+    updateReactions(updates);
+    setPending({});
+    setWriteMsg(`✓ ${dirty.length} reaction(s) written`);
+    setTimeout(() => setWriteMsg(''), 3000);
+  };
+
+  const FLUX_TOL = 1e-6;
+  const maxFlux  = useMemo(() => Math.max(1, ...Object.values(fluxes).map(Math.abs)), [fluxes]);
+  const dirtyN   = Object.keys(pending).length;
+  const isOpt    = result?.status?.toLowerCase() === 'optimal';
+  const ROW_H    = density === 'compact' ? 24 : density === 'relaxed' ? 40 : 32;
+
+  const S = {
+    bg1: 'var(--bg-primary)', bg2: 'var(--bg-secondary)',
+    border: 'var(--border-color)', muted: 'var(--text-muted)',
+    primary: 'var(--primary)', mono: 'var(--font-mono)',
+  };
+
+  // Per-column accent + header tint
+  const C = {
+    id:   { accent: '#22c55e', hdr: isDark ? '#052e16' : '#f0fdf4', txt: isDark ? '#4ade80' : '#166534' },
+    eq:   { accent: '#3b82f6', hdr: isDark ? '#0c1a3a' : '#eff6ff', txt: isDark ? '#93c5fd' : '#1e40af' },
+    lb:   { accent: '#eab308', hdr: isDark ? '#2d1b00' : '#fefce8', txt: isDark ? '#fde68a' : '#854d0e' },
+    ub:   { accent: '#eab308', hdr: isDark ? '#2d1b00' : '#fefce8', txt: isDark ? '#fde68a' : '#854d0e' },
+    gpr:  { accent: '#a855f7', hdr: isDark ? '#1e0a3c' : '#faf5ff', txt: isDark ? '#d8b4fe' : '#6b21a8' },
+    sub:  { accent: '#f97316', hdr: isDark ? '#2c0a00' : '#fff7ed', txt: isDark ? '#fdba74' : '#9a3412' },
+    flux: { accent: '#6366f1', hdr: isDark ? '#0f172a' : '#eef2ff', txt: isDark ? '#a5b4fc' : '#4338ca' },
+  };
+
+  // Shared header cell style factory
+  const hdrBase = (col, sortable, active) => ({
+    padding: '5px 8px',
+    fontSize: 9,
+    fontWeight: 700,
+    textTransform: 'uppercase',
+    letterSpacing: '0.09em',
+    background: active ? C[col].accent + '28' : C[col].hdr,
+    color: active ? C[col].accent : C[col].txt,
+    borderRight: `1.5px solid ${C[col].accent}44`,
+    borderBottom: `2.5px solid ${active ? C[col].accent : C[col].accent + '66'}`,
+    cursor: sortable ? 'pointer' : 'default',
+    userSelect: 'none',
+    display: 'flex',
+    alignItems: 'center',
+    gap: 4,
+    whiteSpace: 'nowrap',
+    boxSizing: 'border-box',
+    flexShrink: 0,
+  });
+
+  const ColHdr = ({ col, label, w, flex, right, sortable }) => {
+    const active = sortCol === col;
+    const onClick = sortable
+      ? () => { setSortDir(sortCol === col ? -sortDir : -1); setSortCol(col); }
+      : undefined;
+    return (
+      <div onClick={onClick}
+        style={{ ...hdrBase(col, sortable, active), ...(flex ? { flex: 1, flexShrink: 1 } : { width: w }), justifyContent: right ? 'flex-end' : 'flex-start' }}>
+        <span style={{ width: 6, height: 6, borderRadius: '50%', background: C[col].accent, flexShrink: 0, opacity: active ? 1 : 0.55 }} />
+        {label}
+        {sortable && active && <span style={{ fontSize: 7, marginLeft: 1 }}>{sortDir > 0 ? '▲' : '▼'}</span>}
+      </div>
+    );
+  };
+
+  const EditCell = ({ id: rxnId, col, val, w, mono, right, number, flex }) => {
+    const isEditing = editing?.rxnId === rxnId && editing?.col === col;
+    const cc = C[col] || { accent: S.border };
+    const base = {
+      ...(flex ? { flex: 1, minWidth: 0 } : { width: w, flexShrink: 0 }),
+      borderRight: `1.5px solid ${cc.accent}2a`,
+      padding: isEditing ? 1 : '0 8px',
+      fontSize: 9,
+      fontFamily: mono ? S.mono : 'system-ui, sans-serif',
+      textAlign: right ? 'right' : 'left',
+      cursor: 'text',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
+      color: 'var(--text-secondary)',
+      boxSizing: 'border-box',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: right ? 'flex-end' : 'flex-start',
+      height: ROW_H,
+    };
+    if (isEditing) return (
+      <div style={base}>
+        <input ref={editRef} type={number ? 'number' : 'text'} value={editVal}
+          onChange={e => setEditVal(e.target.value)}
+          onBlur={commitEdit}
+          onKeyDown={e => { if (e.key === 'Enter') commitEdit(); if (e.key === 'Escape') cancelEdit(); }}
+          style={{ width: '100%', fontSize: 9, padding: '2px 6px', border: `1.5px solid ${cc.accent}`, outline: 'none', fontFamily: mono ? S.mono : 'inherit', background: isDark ? '#1e293b' : '#fff', color: isDark ? '#f1f5f9' : '#111', boxSizing: 'border-box', height: ROW_H - 4 }}
+        />
+      </div>
+    );
+    return (
+      <div onClick={() => startEdit(rxnId, col, val)} style={base} title={String(val)}>
+        {String(val) || <span style={{ opacity: 0.28, fontStyle: 'italic' }}>—</span>}
+      </div>
+    );
+  };
+
+  const FluxCell = ({ flux }) => {
+    const af  = Math.abs(flux);
+    const act = af > FLUX_TOL;
+    const pct = Math.min(100, (af / maxFlux) * 100);
+    let gradient = 'transparent';
+    if (act && pct > 0.5) {
+      gradient = flux > 0
+        ? `linear-gradient(90deg, ${isDark ? '#1d4ed866' : '#bfdbfe'} ${pct.toFixed(1)}%, transparent ${pct.toFixed(1)}%)`
+        : `linear-gradient(270deg, ${isDark ? '#991b1b66' : '#fecaca'} ${pct.toFixed(1)}%, transparent ${pct.toFixed(1)}%)`;
+    }
+    return (
+      <div style={{
+        width: 120, flexShrink: 0, height: ROW_H,
+        padding: '0 10px',
+        display: 'flex', alignItems: 'center', justifyContent: 'flex-end',
+        background: gradient,
+        fontSize: 9, fontFamily: S.mono,
+        color: act
+          ? (flux >= 0 ? (isDark ? '#60a5fa' : '#1d4ed8') : (isDark ? '#f87171' : '#b91c1c'))
+          : S.muted,
+        fontWeight: act ? 600 : 400,
+        borderRight: `1.5px solid ${C.flux.accent}2a`,
+      }}>
+        {act ? (flux >= 0 ? '+' : '') + flux.toFixed(4) : <span style={{ opacity: 0.3 }}>0.0000</span>}
+      </div>
+    );
+  };
+
+  const rowBg = (i, dirty) => {
+    if (dirty) return isDark ? '#422006' : '#fffbeb';
+    return i % 2 === 0
+      ? (isDark ? '#0f172a' : '#ffffff')
+      : (isDark ? '#1e293b' : '#f8fafc');
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: S.bg1, overflow: 'hidden' }}>
+
+      {/* ── Action toolbar ─────────────────────────────────────────────── */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px', flexShrink: 0, background: S.bg2, borderBottom: `1px solid ${S.border}` }}>
+        <div style={{ display: 'flex', border: `1px solid ${S.border}`, borderRadius: 2, overflow: 'hidden' }}>
+          {[['fba','FBA'],['pfba','pFBA'],['fva','FVA']].map(([id, l], i, a) => (
+            <button key={id} onClick={() => setMethod(id)}
+              style={{ fontSize: 9, padding: '3px 9px', background: method === id ? S.primary : 'transparent', color: method === id ? '#fff' : S.muted, borderRight: i < a.length-1 ? `1px solid ${S.border}` : 'none', cursor: 'pointer', border: 'none' }}>
+              {l}
+            </button>
+          ))}
+        </div>
+
+        <select value={objective || ''} onChange={e => setObjective(e.target.value)}
+          style={{ fontSize: 9, padding: '3px 6px', border: `1px solid ${S.border}`, borderRadius: 2, background: S.bg1, color: 'var(--text-secondary)', fontFamily: S.mono, maxWidth: 200 }}>
+          {!objective && <option value="">— select objective —</option>}
+          {Object.keys(rxns).map(id => <option key={id} value={id}>{id}</option>)}
+        </select>
+
+        <button onClick={runFBA} disabled={running || !objective}
+          style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '4px 14px', background: running ? '#6b7280' : S.primary, color: '#fff', fontSize: 10, fontWeight: 700, borderRadius: 2, cursor: 'pointer', border: 'none', opacity: !objective ? 0.45 : 1, fontFamily: 'system-ui' }}>
+          {running ? '⏳ Solving…' : `▶ Run ${method.toUpperCase()}`}
+        </button>
+
+        {isOpt && result?.objectiveValue != null && (
+          <span style={{ fontSize: 10, fontWeight: 700, color: S.primary }}>
+            obj = {result.objectiveValue.toFixed(6)}
+            <span style={{ fontWeight: 400, color: S.muted, marginLeft: 8, fontSize: 9 }}>
+              {Object.values(fluxes).filter(v => Math.abs(v) > FLUX_TOL).length} active &middot; {result._tier ?? 'js'}
+            </span>
+          </span>
+        )}
+        {solveError && <span style={{ fontSize: 9, color: '#ef4444', maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis' }}>{solveError}</span>}
+
+        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+          {dirtyN > 0 && <>
+            <span style={{ fontSize: 9, color: '#d97706', fontFamily: 'system-ui' }}>{dirtyN} unsaved</span>
+            <button onClick={writeToModel} style={{ fontSize: 9, padding: '3px 10px', background: '#16a34a', color: '#fff', borderRadius: 2, border: 'none', cursor: 'pointer', fontWeight: 700, fontFamily: 'system-ui' }}>Write to model</button>
+            <button onClick={() => setPending({})} style={{ fontSize: 9, padding: '3px 8px', border: `1px solid ${S.border}`, borderRadius: 2, color: S.muted, background: 'transparent', cursor: 'pointer', fontFamily: 'system-ui' }}>Discard</button>
+          </>}
+          {writeMsg && <span style={{ fontSize: 9, color: '#16a34a', fontFamily: 'system-ui' }}>{writeMsg}</span>}
+        </div>
+      </div>
+
+      {/* ── Format bar ─────────────────────────────────────────────────── */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 12px', flexShrink: 0, background: isDark ? '#0d1726' : '#f1f5f9', borderBottom: `1px solid ${S.border}` }}>
+
+        {/* Columns picker */}
+        <div ref={colMenuRef} style={{ position: 'relative' }}>
+          <button onClick={() => setShowColMenu(v => !v)}
+            style={{ fontSize: 9, padding: '2px 8px', border: `1px solid ${S.border}`, borderRadius: 2, background: showColMenu ? S.primary : (isDark ? '#1e293b' : '#fff'), color: showColMenu ? '#fff' : S.muted, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, fontFamily: 'system-ui' }}>
+            Columns <span style={{ fontSize: 7 }}>▾</span>
+          </button>
+          {showColMenu && (
+            <div style={{ position: 'absolute', top: 'calc(100% + 4px)', left: 0, zIndex: 200, background: isDark ? '#1e293b' : '#fff', border: `1px solid ${S.border}`, borderRadius: 4, padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 6, minWidth: 160, boxShadow: '0 6px 16px rgba(0,0,0,0.18)' }}>
+              {[['eq','Equation','eq'],['lb','Lower Bound','lb'],['ub','Upper Bound','ub'],['gpr','GPR','gpr'],['sub','Subsystem','sub']].map(([k, l, col]) => (
+                <label key={k} style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 10, cursor: 'pointer', color: 'var(--text-secondary)', userSelect: 'none', fontFamily: 'system-ui' }}>
+                  <input type="checkbox" checked={visibleCols[k]} onChange={() => setVisibleCols(p => ({ ...p, [k]: !p[k] }))} style={{ accentColor: C[col].accent, cursor: 'pointer' }} />
+                  <span style={{ width: 7, height: 7, borderRadius: '50%', background: C[col].accent, flexShrink: 0 }} />
+                  {l}
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Row density */}
+        <div style={{ display: 'flex', border: `1px solid ${S.border}`, borderRadius: 2, overflow: 'hidden' }}>
+          {[['compact','≡ Compact'],['normal','☰ Normal'],['relaxed','⊟ Relaxed']].map(([d, label], i, a) => (
+            <button key={d} onClick={() => setDensity(d)}
+              style={{ padding: '2px 9px', fontSize: 9, background: density === d ? '#475569' : (isDark ? '#1e293b' : '#fff'), color: density === d ? '#fff' : S.muted, border: 'none', borderRight: i < a.length-1 ? `1px solid ${S.border}` : 'none', cursor: 'pointer', fontFamily: 'system-ui' }}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {/* Column legend */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginLeft: 4 }}>
+          {[['ID','id'],['Eq','eq'],['LB/UB','lb'],['GPR','gpr'],['Sub','sub'],['Flux','flux']].map(([l, col]) => (
+            <span key={col} style={{ display: 'flex', alignItems: 'center', gap: 3, fontSize: 8.5, color: S.muted, fontFamily: 'system-ui' }}>
+              <span style={{ width: 6, height: 6, borderRadius: '50%', background: C[col].accent, flexShrink: 0 }} />
+              {l}
+            </span>
+          ))}
+        </div>
+
+        {/* Filter */}
+        <input value={filter} onChange={e => setFilter(e.target.value)} placeholder="Filter reactions…"
+          style={{ marginLeft: 'auto', fontSize: 9, padding: '3px 8px', border: `1px solid ${S.border}`, borderRadius: 2, background: isDark ? '#1e293b' : '#fff', color: 'var(--text-secondary)', width: 170, fontFamily: 'system-ui' }} />
+      </div>
+
+      {/* ── Column headers ───────────────────────────────────────────────── */}
+      <div style={{ display: 'flex', flexShrink: 0 }}>
+        <ColHdr col="id"   label="Reaction ID"          w={130}      sortable />
+        {visibleCols.eq  && <ColHdr col="eq"   label="Equation (click to edit)" flex         />}
+        {visibleCols.lb  && <ColHdr col="lb"   label="LB"                       w={70}  right sortable />}
+        {visibleCols.ub  && <ColHdr col="ub"   label="UB"                       w={70}  right sortable />}
+        {visibleCols.gpr && <ColHdr col="gpr"  label="GPR"                      w={190}      />}
+        {visibleCols.sub && <ColHdr col="sub"  label="Subsystem"                 w={150}      />}
+        <ColHdr col="flux" label="Flux"                 w={120} right sortable />
+      </div>
+
+      {/* ── Rows ─────────────────────────────────────────────────────────── */}
+      <div style={{ flex: 1, overflowY: 'auto' }}>
+        {rows.map((row, i) => {
+          const { id, lb, ub, gpr, sub, eq, flux, dirty } = row;
+          return (
+            <div key={id} style={{
+              display: 'flex', alignItems: 'stretch',
+              background: rowBg(i, dirty),
+              borderBottom: `1px solid ${isDark ? '#1e293b' : '#e2e8f0'}`,
+              borderLeft: dirty ? '3px solid #d97706' : '3px solid transparent',
+              minHeight: ROW_H,
+            }}>
+              <div style={{
+                width: 127, flexShrink: 0, padding: '0 8px', height: ROW_H,
+                fontSize: 9, fontFamily: S.mono,
+                borderRight: `1.5px solid ${C.id.accent}2a`,
+                color: dirty ? '#d97706' : C.id.accent,
+                fontWeight: dirty ? 700 : 500,
+                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                display: 'flex', alignItems: 'center',
+              }} title={id}>{id}</div>
+              {visibleCols.eq  && <EditCell id={id} col="eq"  val={eq}  flex  mono />}
+              {visibleCols.lb  && <EditCell id={id} col="lb"  val={lb}  w={70}  right number mono />}
+              {visibleCols.ub  && <EditCell id={id} col="ub"  val={ub}  w={70}  right number mono />}
+              {visibleCols.gpr && <EditCell id={id} col="gpr" val={gpr} w={190} mono />}
+              {visibleCols.sub && <EditCell id={id} col="sub" val={sub} w={150} />}
+              <FluxCell flux={flux} />
+            </div>
+          );
+        })}
+      </div>
+
+      {/* ── Status bar ───────────────────────────────────────────────────── */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '3px 12px', flexShrink: 0, background: S.bg2, borderTop: `1px solid ${S.border}`, fontSize: 9, color: S.muted, fontFamily: 'system-ui' }}>
+        <span>{rows.length} reactions</span>
+        {filter && <span>of {Object.keys(rxns).length} total</span>}
+        {dirtyN > 0 && <span style={{ color: '#d97706' }}>● {dirtyN} unsaved edits</span>}
+        {isOpt && <span style={{ color: '#16a34a' }}>✓ {method.toUpperCase()} solved &middot; obj = {result.objectiveValue?.toFixed(6)}</span>}
+        <span style={{ marginLeft: 'auto', opacity: 0.55 }}>Click any cell to edit &middot; Enter = confirm &middot; Esc = cancel</span>
+      </div>
+    </div>
+  );
+}
 
 /**
  * Hierarchical pathway categories based on BiGG/KEGG classification
@@ -116,7 +547,7 @@ function DonutChart({ data, total, size = 108, centerValue, centerLabel }) {
   );
 }
 
-const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 700, onReactionSelect }) => {
+const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 700, onReactionSelect, onFluxUpdate }) => {
   const { isDark, accessibleColors } = useTheme();
   const { currentModel, updateReactions, deleteReaction } = useModel();
   const searchInputRef = useRef(null);
@@ -533,7 +964,7 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
     const statCards = [
       { label: 'Reactions',     value: rxnList.length.toLocaleString(),        sub: `${pctRev}% reversible`         },
       { label: 'Metabolites',   value: metList.length.toLocaleString(),        sub: `${compartments.length} compartments` },
-      { label: 'Genes',         value: Object.keys(genes).length.toLocaleString(), sub: `${pctGPR}% rxn coverage`   },
+      { label: 'Genes',         value: Object.keys(genes).length.toLocaleString(), sub: `unique genes · ${pctGPR}% rxn coverage`   },
       { label: 'Subsystems',    value: subsystems.size.toLocaleString(),       sub: `${categoryHierarchy.size} categories` },
       { label: 'Exchange',      value: exchange.toLocaleString(),              sub: 'boundary reactions'            },
       { label: 'Blocked',       value: blocked.toLocaleString(),               sub: 'lb = ub = 0'                  },
@@ -756,97 +1187,49 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
     URL.revokeObjectURL(url);
   }, [currentModel?.id]);
 
-  const renderTreemap = () => {
-    const { rects, TW, TH, PAD } = buildTreemapRects();
-    // Category legend
+  const renderCategoryBar = () => {
     const categories = Array.from(categoryHierarchy.entries())
       .sort((a, b) => b[1].totalReactions - a[1].totalReactions);
+    const total = categories.reduce((s, [, d]) => s + d.totalReactions, 0) || 1;
 
     return (
-      <div className="px-4 pb-4">
+      <div className="px-4 pb-2">
         <div className="p-4" style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-color)', borderRadius: 3 }}>
-          <div className="flex items-center justify-between mb-3">
-            <p className="text-[10px] font-medium uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>
-              Subsystem treemap — click to navigate
-            </p>
-            <button
-              onClick={downloadTreemapSVG}
-              className="flex items-center gap-1.5 px-3 py-1 text-xs transition-colors"
-              style={{ border: '1px solid var(--border-color)', borderRadius: 2, color: 'var(--text-secondary)', background: 'transparent' }}
-              onMouseEnter={e => e.currentTarget.style.color = 'var(--text-primary)'}
-              onMouseLeave={e => e.currentTarget.style.color = 'var(--text-secondary)'}
-            >
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-              </svg>
-              Export SVG
-            </button>
-          </div>
+          <p className="text-[10px] font-medium uppercase tracking-widest mb-3" style={{ color: 'var(--text-muted)' }}>
+            Pathway distribution — click to navigate
+          </p>
 
-          <svg
-            ref={treemapRef}
-            width="100%"
-            viewBox={`0 0 ${TW} ${TH}`}
-            preserveAspectRatio="xMidYMid meet"
-            style={{ display: 'block', cursor: 'pointer' }}
-          >
-            <rect width={TW} height={TH} fill={isDark ? '#111827' : '#f8fafc'} />
-            {rects.map((r, i) => {
-              const showLabel = r.w > 50 && r.h > 16;
-              const fontSize = Math.min(14, Math.max(8, r.h * 0.3));
-              // Width-aware truncation: ~0.58 char width/font-size ratio
-              const maxChars = Math.max(3, Math.floor((r.w - PAD * 4) / (fontSize * 0.58)));
-              const label = r.subsystem.length > maxChars
-                ? r.subsystem.substring(0, maxChars - 1) + '…'
-                : r.subsystem;
-              const showCount = r.h > 28 && r.w > 40;
-              return (
-                <g key={i} onClick={() => navigateToSubsystem(r.subsystem, r.category)}>
-                  <title>{r.subsystem} — {r.reactions} reactions ({r.category})</title>
-                  <rect
-                    x={r.x + PAD} y={r.y + PAD}
-                    width={Math.max(0, r.w - PAD * 2)} height={Math.max(0, r.h - PAD * 2)}
-                    fill={r.color} fillOpacity={isDark ? 0.75 : 0.82} rx={3}
-                  />
-                  {showLabel && (
-                    <text
-                      x={r.x + r.w / 2}
-                      y={r.y + r.h / 2 + (showCount ? -fontSize * 0.4 : 0)}
-                      textAnchor="middle" dominantBaseline="middle"
-                      fill="white" fontSize={fontSize} fontWeight="600"
-                      style={{ pointerEvents: 'none' }}
-                    >
-                      {label}
-                    </text>
-                  )}
-                  {showCount && (
-                    <text
-                      x={r.x + r.w / 2} y={r.y + r.h / 2 + fontSize * 0.7}
-                      textAnchor="middle" dominantBaseline="middle"
-                      fill="white" fontSize={Math.max(7, fontSize * 0.72)} opacity={0.85}
-                      style={{ pointerEvents: 'none' }}
-                    >
-                      {r.reactions}
-                    </text>
-                  )}
-                </g>
-              );
-            })}
-          </svg>
-
-          {/* Category legend */}
-          <div className="flex flex-wrap gap-3 mt-3">
-            {categories.map(([cat]) => {
+          {/* Stacked proportion bar */}
+          <div className="flex h-6 overflow-hidden mb-3" style={{ borderRadius: 2 }}>
+            {categories.map(([cat, data]) => {
               const palette = getCategoryPalette(cat);
-              const icon = CATEGORY_ICONS[cat] || '📦';
+              const pct = (data.totalReactions / total) * 100;
+              if (pct < 0.5) return null;
               return (
                 <button
                   key={cat}
                   onClick={() => navigateToCategory(cat)}
-                  className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
+                  title={`${cat}: ${data.totalReactions} rxns (${pct.toFixed(1)}%)`}
+                  style={{ width: `${pct}%`, background: palette.bg, flexShrink: 0, minWidth: 2 }}
+                />
+              );
+            })}
+          </div>
+
+          {/* Legend — compact inline chips */}
+          <div className="flex flex-wrap gap-x-4 gap-y-1.5">
+            {categories.map(([cat, data]) => {
+              const palette = getCategoryPalette(cat);
+              const pct = ((data.totalReactions / total) * 100).toFixed(1);
+              return (
+                <button
+                  key={cat}
+                  onClick={() => navigateToCategory(cat)}
+                  className="flex items-center gap-1.5 transition-opacity hover:opacity-70"
                 >
-                  <span className="w-3 h-3 rounded-sm flex-shrink-0" style={{ backgroundColor: palette.bg }} />
-                  <span>{icon} {cat}</span>
+                  <span style={{ width: 8, height: 8, borderRadius: 1, background: palette.bg, flexShrink: 0, display: 'inline-block' }} />
+                  <span className="text-[10px]" style={{ color: 'var(--text-secondary)' }}>{cat}</span>
+                  <span className="text-[10px]" style={{ color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>{pct}%</span>
                 </button>
               );
             })}
@@ -986,6 +1369,76 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
     URL.revokeObjectURL(url);
   }, [currentModel]);
 
+  const exportMetabolitesCSV = useCallback(() => {
+    const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const header = 'id,name,formula,compartment,charge';
+    const lines = Object.entries(currentModel?.metabolites || {}).map(([id, met]) =>
+      [id, met.name || '', met.formula || '', met.compartment || '', met.charge ?? ''].map(esc).join(',')
+    );
+    const blob = new Blob([[header, ...lines].join('\n')], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `${currentModel?.id || 'model'}_metabolites.csv`; a.click();
+    URL.revokeObjectURL(url);
+  }, [currentModel]);
+
+  const exportGenesCSV = useCallback(() => {
+    const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const geneRxnMap = {};
+    Object.entries(currentModel?.reactions || {}).forEach(([rxnId, rxn]) => {
+      const rule = rxn.gpr || rxn.gene_reaction_rule || '';
+      if (!rule) return;
+      rule.replace(/[()]/g, '').split(/\s+(?:and|or)\s+/i).map(g => g.trim()).filter(Boolean)
+        .forEach(g => { if (!geneRxnMap[g]) geneRxnMap[g] = { rxns: [], rule }; geneRxnMap[g].rxns.push(rxnId); });
+    });
+    const header = 'id,name,reaction_count,associated_reactions,example_gpr';
+    const lines = Object.entries(currentModel?.genes || {}).map(([id, gene]) => {
+      const info = geneRxnMap[id] || { rxns: [], rule: '' };
+      return [id, gene.product || gene.name || '', info.rxns.length, info.rxns.join(';'), info.rule].map(esc).join(',');
+    });
+    const blob = new Blob([[header, ...lines].join('\n')], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `${currentModel?.id || 'model'}_genes.csv`; a.click();
+    URL.revokeObjectURL(url);
+  }, [currentModel]);
+
+  const exportSmatrixCSV = useCallback(() => {
+    const rxns = currentModel?.reactions || {};
+    const mets = currentModel?.metabolites || {};
+    const rxnIds = Object.keys(rxns);
+    const metIds = Object.keys(mets);
+    const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const header = [esc('metabolite_id'), ...rxnIds.map(esc)].join(',');
+    const lines = metIds.map(metId => {
+      const coeffs = rxnIds.map(rxnId => rxns[rxnId]?.metabolites?.[metId] ?? 0);
+      return [esc(metId), ...coeffs].join(',');
+    });
+    const blob = new Blob([[header, ...lines].join('\n')], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `${currentModel?.id || 'model'}_smatrix.csv`; a.click();
+    URL.revokeObjectURL(url);
+  }, [currentModel]);
+
+  const exportFluxCSV = useCallback(() => {
+    const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const rxns = currentModel?.reactions || {};
+    const FLUX_TOL = 1e-6;
+    const header = 'reaction_id,flux,lower_bound,upper_bound,subsystem,gpr,active';
+    const lines = Object.entries(rxns).map(([id, rxn]) => {
+      const f = fluxes[id] ?? 0;
+      return [id, f.toFixed(8), rxn.lower_bound ?? -1000, rxn.upper_bound ?? 1000,
+        rxn.subsystem || '', rxn.gpr || rxn.gene_reaction_rule || '',
+        Math.abs(f) > FLUX_TOL ? 'yes' : 'no'].map(esc).join(',');
+    });
+    const blob = new Blob([[header, ...lines].join('\n')], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `${currentModel?.id || 'model'}_flux_results.csv`; a.click();
+    URL.revokeObjectURL(url);
+  }, [currentModel, fluxes]);
+
   // Inline reaction editing state
   const [editingRxnId, setEditingRxnId] = useState(null);
   const [editDraft, setEditDraft] = useState({});
@@ -1069,7 +1522,6 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
   const renderReactionsTab = () => {
     const allRxns = currentModel?.reactions || {};
     const mets = currentModel?.metabolites || {};
-    const [q, setQ] = [reactionsQuery, setReactionsQuery];
     const rows = Object.entries(allRxns).map(([id, rxn]) => {
       const r = Object.entries(rxn.metabolites || {}).filter(([,c]) => c < 0).map(([m]) => mets[m]?.name || m);
       const p = Object.entries(rxn.metabolites || {}).filter(([,c]) => c > 0).map(([m]) => mets[m]?.name || m);
@@ -1086,132 +1538,145 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
       r.gpr.toLowerCase().includes(qlo) || r.subsystem.toLowerCase().includes(qlo)
     ) : rows;
 
+    // column accent palette
+    const RC = {
+      id:   { accent: '#22c55e', hdr: isDark ? '#052e16' : '#f0fdf4', txt: isDark ? '#4ade80' : '#166534' },
+      eq:   { accent: '#3b82f6', hdr: isDark ? '#0c1a3a' : '#eff6ff', txt: isDark ? '#93c5fd' : '#1e40af' },
+      sub:  { accent: '#f97316', hdr: isDark ? '#2c0a00' : '#fff7ed', txt: isDark ? '#fdba74' : '#9a3412' },
+      bnd:  { accent: '#eab308', hdr: isDark ? '#2d1b00' : '#fefce8', txt: isDark ? '#fde68a' : '#854d0e' },
+      gpr:  { accent: '#a855f7', hdr: isDark ? '#1e0a3c' : '#faf5ff', txt: isDark ? '#d8b4fe' : '#6b21a8' },
+      edit: { accent: '#64748b', hdr: isDark ? '#1e293b' : '#f1f5f9', txt: isDark ? '#94a3b8' : '#475569' },
+    };
+    const th = (col, label, extra = {}) => (
+      <th style={{ padding: '5px 8px', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.09em', background: RC[col].hdr, color: RC[col].txt, borderRight: `1.5px solid ${RC[col].accent}44`, borderBottom: `2.5px solid ${RC[col].accent}99`, whiteSpace: 'nowrap', userSelect: 'none', textAlign: extra.center ? 'center' : 'left', ...extra }}>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+          <span style={{ width: 6, height: 6, borderRadius: '50%', background: RC[col].accent, opacity: 0.7, flexShrink: 0, display: 'inline-block' }} />
+          {label}
+        </span>
+      </th>
+    );
+    const rowBg = (i, editing) => editing ? (isDark ? '#1e3a5f' : '#eff6ff') : i % 2 === 0 ? (isDark ? '#0f172a' : '#ffffff') : (isDark ? '#1e293b' : '#f8fafc');
+    const tdBorder = col => ({ borderRight: `1.5px solid ${RC[col].accent}22` });
+    const inCls = 'w-full text-[10px] px-1.5 py-0.5 border border-[var(--border-color)] bg-[var(--bg-primary)] text-[var(--text-primary)] font-mono focus:outline-none focus:ring-1 focus:ring-[var(--primary)]';
+
     return (
-      <div className="flex flex-col">
-        <div className="flex flex-wrap items-center gap-3 px-4 py-2.5 border-b border-[var(--border-color)] bg-[var(--bg-secondary)]">
-          <input value={reactionsQuery} onChange={e => setReactionsQuery(e.target.value)}
-            placeholder="Search by ID, name, metabolite, GPR, subsystem…"
-            className="flex-1 min-w-64 px-3 py-1.5 text-sm rounded-lg border border-[var(--border-color)] bg-[var(--bg-primary)] text-[var(--text-primary)] placeholder-[var(--text-muted)] focus:outline-none focus:ring-1 focus:ring-[var(--primary)]" />
-          <div className="flex items-center gap-2 text-xs text-[var(--text-muted)]">
-            <span className="font-medium text-[var(--text-secondary)]">{filtered.length}</span> / {rows.length} reactions
-            <span className="text-amber-600 ml-2">{rows.filter(r => r.rev).length} reversible</span>
-          </div>
-          <div className="flex items-center gap-1.5 ml-auto">
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+        {/* toolbar */}
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, padding: '6px 12px', flexShrink: 0, background: isDark ? '#0d1726' : '#f1f5f9', borderBottom: '1px solid var(--border-color)' }}>
+          <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-muted)', fontFamily: 'system-ui', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Reactions</span>
+          <span style={{ fontSize: 9, color: 'var(--text-muted)', fontFamily: 'system-ui' }}>
+            <b style={{ color: 'var(--text-secondary)' }}>{filtered.length}</b> / {rows.length}
+            &nbsp;&middot;&nbsp;
+            <span style={{ color: '#d97706' }}>{rows.filter(r => r.rev).length} reversible</span>
+          </span>
+          <div style={{ display: 'flex', gap: 6, marginLeft: 'auto', alignItems: 'center' }}>
             <button onClick={exportAllReactionsCSV}
-              className="flex items-center gap-1 px-2.5 py-1 text-xs rounded border border-[var(--border-color)] text-[var(--text-secondary)] hover:bg-[var(--bg-primary)] transition-colors">
+              style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '2px 8px', fontSize: 9, border: '1px solid var(--border-color)', borderRadius: 2, color: 'var(--text-secondary)', background: 'transparent', cursor: 'pointer', fontFamily: 'system-ui' }}>
               <Download className="w-3 h-3" /> Export CSV
             </button>
             <button onClick={() => csvImportRef.current?.click()}
-              className="flex items-center gap-1 px-2.5 py-1 text-xs rounded border border-[var(--border-color)] text-[var(--text-secondary)] hover:bg-[var(--bg-primary)] transition-colors">
+              style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '2px 8px', fontSize: 9, border: '1px solid var(--border-color)', borderRadius: 2, color: 'var(--text-secondary)', background: 'transparent', cursor: 'pointer', fontFamily: 'system-ui' }}>
               <FileText className="w-3 h-3" /> Import CSV
             </button>
-            <input ref={csvImportRef} type="file" accept=".csv" onChange={handleCSVImport} className="hidden" />
+            <input ref={csvImportRef} type="file" accept=".csv" onChange={handleCSVImport} style={{ display: 'none' }} />
+            <input value={reactionsQuery} onChange={e => setReactionsQuery(e.target.value)}
+              placeholder="Filter…"
+              style={{ fontSize: 9, padding: '3px 8px', border: '1px solid var(--border-color)', borderRadius: 2, background: isDark ? '#1e293b' : '#fff', color: 'var(--text-secondary)', width: 170, fontFamily: 'system-ui' }} />
           </div>
         </div>
         {csvImportMsg && (
-          <div className={`px-4 py-2 text-xs font-medium ${csvImportMsg.ok ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>
+          <div style={{ padding: '4px 12px', fontSize: 9, fontFamily: 'system-ui', background: csvImportMsg.ok ? (isDark ? '#052e16' : '#f0fdf4') : (isDark ? '#450a0a' : '#fef2f2'), color: csvImportMsg.ok ? '#16a34a' : '#dc2626' }}>
             {csvImportMsg.ok ? '✓' : '✗'} {csvImportMsg.text}
           </div>
         )}
-        <div className="overflow-auto">
-          <table className="w-full text-sm border-collapse">
-            <thead className="bg-[var(--bg-secondary)] sticky top-0 z-10">
-              <tr className="text-left text-xs text-[var(--text-muted)] border-b border-[var(--border-color)]">
-                <th className="px-3 py-2 font-medium w-36">ID</th>
-                <th className="px-3 py-2 font-medium">Stoichiometry</th>
-                <th className="px-3 py-2 font-medium w-36">Subsystem</th>
-                <th className="px-3 py-2 font-medium w-28">Bounds [lb, ub]</th>
-                <th className="px-3 py-2 font-medium w-44">GPR</th>
-                <th className="px-3 py-2 font-medium w-16 text-center">Edit</th>
+        <div style={{ flex: 1, overflowY: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
+            <colgroup>
+              <col style={{ width: 140 }} /><col /><col style={{ width: 140 }} />
+              <col style={{ width: 110 }} /><col style={{ width: 176 }} /><col style={{ width: 64 }} />
+            </colgroup>
+            <thead style={{ position: 'sticky', top: 0, zIndex: 10 }}>
+              <tr>
+                {th('id',  'ID')}
+                {th('eq',  'Stoichiometry')}
+                {th('sub', 'Subsystem')}
+                {th('bnd', 'Bounds [lb, ub]')}
+                {th('gpr', 'GPR')}
+                {th('edit','Edit', { textAlign: 'center' })}
               </tr>
             </thead>
             <tbody>
-              {filtered.map(row => {
+              {filtered.map((row, i) => {
                 const isEditing = editingRxnId === row.id;
                 const confirming = confirmDeleteId === row.id;
-                const inCls = 'w-full text-[10px] px-1.5 py-0.5 border border-[var(--border-color)] bg-[var(--bg-primary)] text-[var(--text-primary)] font-mono focus:outline-none focus:ring-1 focus:ring-[var(--primary)]';
                 return (
                   <tr key={row.id}
-                    className={`group border-b border-[var(--border-color)] transition-colors ${isEditing ? 'bg-blue-50 dark:bg-blue-950' : 'hover:bg-[var(--bg-secondary)] cursor-pointer'}`}
+                    style={{ background: rowBg(i, isEditing), borderBottom: `1px solid ${isDark ? '#1e293b' : '#e2e8f0'}`, cursor: isEditing ? 'default' : 'pointer' }}
                     onClick={!isEditing ? () => onReactionSelect?.(row.id) : undefined}>
-                    <td className="px-3 py-2" onClick={e => isEditing && e.stopPropagation()}>
-                      <div className="font-mono text-xs font-medium text-[var(--text-primary)]">{row.id}</div>
+                    <td style={{ padding: '5px 8px', fontSize: 9, fontFamily: 'var(--font-mono)', ...tdBorder('id') }} onClick={e => isEditing && e.stopPropagation()}>
+                      <div style={{ fontWeight: 600, color: RC.id.accent, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.id}</div>
                       {isEditing ? (
                         <input value={editDraft.name} onChange={e => setEditDraft(d => ({ ...d, name: e.target.value }))}
                           className={inCls} placeholder="Display name" onClick={e => e.stopPropagation()} />
                       ) : (
                         <>
-                          {row.name && row.name !== row.id && <div className="text-xs text-[var(--text-muted)] truncate max-w-[130px]" title={row.name}>{row.name}</div>}
-                          <div className="flex gap-1 mt-0.5">
-                            {row.rev    && <span className="px-1 text-[10px] rounded bg-amber-100 text-amber-700">rev</span>}
-                            {row.hasGPR && <span className="px-1 text-[10px] rounded bg-blue-100 text-blue-700">gpr</span>}
+                          {row.name && row.name !== row.id && <div style={{ fontSize: 8.5, color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={row.name}>{row.name}</div>}
+                          <div style={{ display: 'flex', gap: 3, marginTop: 2 }}>
+                            {row.rev    && <span style={{ padding: '0 4px', fontSize: 8, borderRadius: 2, background: isDark ? '#451a03' : '#fef3c7', color: '#d97706' }}>rev</span>}
+                            {row.hasGPR && <span style={{ padding: '0 4px', fontSize: 8, borderRadius: 2, background: isDark ? '#1e3a5f' : '#dbeafe', color: RC.gpr.accent }}>gpr</span>}
                           </div>
                         </>
                       )}
                     </td>
-                    <td className="px-3 py-2 font-mono text-xs text-[var(--text-secondary)]">
-                      <span className="text-red-500">{row.reactants.slice(0,3).join(' + ')}{row.reactants.length > 3 ? ` +${row.reactants.length-3}` : ''}</span>
-                      <span className="mx-1 text-[var(--text-muted)]">{row.rev ? '⇌' : '→'}</span>
-                      <span className="text-green-600">{row.products.slice(0,3).join(' + ')}{row.products.length > 3 ? ` +${row.products.length-3}` : ''}</span>
+                    <td style={{ padding: '5px 8px', fontSize: 9, fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)', overflow: 'hidden', ...tdBorder('eq') }}>
+                      <span style={{ color: isDark ? '#f87171' : '#dc2626' }}>{row.reactants.slice(0,3).join(' + ')}{row.reactants.length > 3 ? ` +${row.reactants.length-3}` : ''}</span>
+                      <span style={{ margin: '0 4px', color: 'var(--text-muted)' }}>{row.rev ? '⇌' : '→'}</span>
+                      <span style={{ color: isDark ? '#4ade80' : '#16a34a' }}>{row.products.slice(0,3).join(' + ')}{row.products.length > 3 ? ` +${row.products.length-3}` : ''}</span>
                     </td>
-                    <td className="px-3 py-2 text-xs text-[var(--text-muted)]" onClick={e => isEditing && e.stopPropagation()}>
+                    <td style={{ padding: '5px 8px', fontSize: 9, color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', ...tdBorder('sub') }} onClick={e => isEditing && e.stopPropagation()}>
                       {isEditing ? (
                         <input value={editDraft.subsystem} onChange={e => setEditDraft(d => ({ ...d, subsystem: e.target.value }))}
                           className={inCls} placeholder="Subsystem" onClick={e => e.stopPropagation()} />
                       ) : (
-                        <span className="truncate block max-w-[130px]" title={row.subsystem}>{row.subsystem || '—'}</span>
+                        <span title={row.subsystem}>{row.subsystem || '—'}</span>
                       )}
                     </td>
-                    <td className="px-3 py-2 font-mono text-xs" onClick={e => isEditing && e.stopPropagation()}>
+                    <td style={{ padding: '5px 8px', fontSize: 9, fontFamily: 'var(--font-mono)', color: RC.bnd.accent, ...tdBorder('bnd') }} onClick={e => isEditing && e.stopPropagation()}>
                       {isEditing ? (
-                        <div className="flex items-center gap-1" onClick={e => e.stopPropagation()}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }} onClick={e => e.stopPropagation()}>
                           <input type="number" value={editDraft.lb} onChange={e => setEditDraft(d => ({ ...d, lb: e.target.value }))}
                             className="w-16 text-[10px] px-1 py-0.5 border border-[var(--border-color)] bg-[var(--bg-primary)] font-mono focus:outline-none" title="Lower bound" />
-                          <span className="text-[var(--text-muted)]">→</span>
+                          <span style={{ color: 'var(--text-muted)' }}>→</span>
                           <input type="number" value={editDraft.ub} onChange={e => setEditDraft(d => ({ ...d, ub: e.target.value }))}
                             className="w-16 text-[10px] px-1 py-0.5 border border-[var(--border-color)] bg-[var(--bg-primary)] font-mono focus:outline-none" title="Upper bound" />
                         </div>
                       ) : (
-                        <span className="text-[var(--text-muted)]">[{row.lb}, {row.ub}]</span>
+                        <span>[{row.lb}, {row.ub}]</span>
                       )}
                     </td>
-                    <td className="px-3 py-2 font-mono text-xs text-[var(--text-muted)]" onClick={e => isEditing && e.stopPropagation()}>
+                    <td style={{ padding: '5px 8px', fontSize: 8.5, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', ...tdBorder('gpr') }} onClick={e => isEditing && e.stopPropagation()}>
                       {isEditing ? (
                         <input value={editDraft.gpr} onChange={e => setEditDraft(d => ({ ...d, gpr: e.target.value }))}
                           className={inCls} placeholder="gene1 and gene2" onClick={e => e.stopPropagation()} />
                       ) : (
-                        <span className="break-all" style={{ lineHeight: 1.3 }}>{row.gpr || '—'}</span>
+                        <span title={row.gpr}>{row.gpr || '—'}</span>
                       )}
                     </td>
-                    <td className="px-3 py-2 text-center" onClick={e => e.stopPropagation()}>
+                    <td style={{ padding: '5px 8px', textAlign: 'center' }} onClick={e => e.stopPropagation()}>
                       {isEditing ? (
-                        <div className="flex items-center justify-center gap-1">
-                          <button onClick={saveEdit} title="Save changes"
-                            className="p-1 rounded bg-green-600 text-white hover:bg-green-700 transition-colors">
-                            <Check className="w-3 h-3" />
-                          </button>
-                          <button onClick={cancelEdit} title="Cancel"
-                            className="p-1 rounded bg-[var(--bg-primary)] text-[var(--text-muted)] border border-[var(--border-color)] hover:text-red-500 transition-colors">
-                            <XIcon className="w-3 h-3" />
-                          </button>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}>
+                          <button onClick={saveEdit} title="Save" style={{ padding: 3, borderRadius: 3, background: '#16a34a', color: '#fff', border: 'none', cursor: 'pointer' }}><Check className="w-3 h-3" /></button>
+                          <button onClick={cancelEdit} title="Cancel" style={{ padding: 3, borderRadius: 3, background: 'transparent', color: 'var(--text-muted)', border: '1px solid var(--border-color)', cursor: 'pointer' }}><XIcon className="w-3 h-3" /></button>
                         </div>
                       ) : confirming ? (
-                        <div className="flex items-center gap-1">
-                          <button onClick={() => { deleteReaction(row.id); setConfirmDeleteId(null); }}
-                            className="text-[9px] px-1.5 py-0.5 rounded bg-red-600 text-white font-bold hover:bg-red-700">del</button>
-                          <button onClick={() => setConfirmDeleteId(null)}
-                            className="text-[9px] px-1.5 py-0.5 rounded border border-[var(--border-color)] text-[var(--text-muted)]">no</button>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+                          <button onClick={() => { deleteReaction(row.id); setConfirmDeleteId(null); }} style={{ fontSize: 8, padding: '1px 5px', borderRadius: 2, background: '#dc2626', color: '#fff', fontWeight: 700, border: 'none', cursor: 'pointer' }}>del</button>
+                          <button onClick={() => setConfirmDeleteId(null)} style={{ fontSize: 8, padding: '1px 5px', borderRadius: 2, border: '1px solid var(--border-color)', color: 'var(--text-muted)', background: 'transparent', cursor: 'pointer' }}>no</button>
                         </div>
                       ) : (
-                        <div className="flex items-center justify-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                          <button onClick={() => startEdit(row)} title="Edit reaction"
-                            className="p-1 rounded hover:bg-[var(--bg-primary)] text-[var(--text-muted)] hover:text-[var(--primary)] transition-colors">
-                            <Pencil className="w-3 h-3" />
-                          </button>
-                          <button onClick={() => setConfirmDeleteId(row.id)} title="Delete reaction"
-                            className="p-1 rounded hover:bg-[var(--bg-primary)] text-[var(--text-muted)] hover:text-red-500 transition-colors">
-                            <Trash2 className="w-3 h-3" />
-                          </button>
+                        <div className="group-hover-visible" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 3, opacity: 0 }} onMouseEnter={e => e.currentTarget.style.opacity=1} onMouseLeave={e => e.currentTarget.style.opacity=0}>
+                          <button onClick={() => startEdit(row)} title="Edit" style={{ padding: 3, borderRadius: 3, background: 'transparent', color: 'var(--text-muted)', border: 'none', cursor: 'pointer' }}><Pencil className="w-3 h-3" /></button>
+                          <button onClick={() => setConfirmDeleteId(row.id)} title="Delete" style={{ padding: 3, borderRadius: 3, background: 'transparent', color: 'var(--text-muted)', border: 'none', cursor: 'pointer' }}><Trash2 className="w-3 h-3" /></button>
                         </div>
                       )}
                     </td>
@@ -1220,7 +1685,11 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
               })}
             </tbody>
           </table>
-          {filtered.length === 0 && <div className="text-center py-12 text-[var(--text-muted)] text-sm">No reactions match "{reactionsQuery}"</div>}
+          {filtered.length === 0 && <div style={{ textAlign: 'center', padding: '48px 0', color: 'var(--text-muted)', fontSize: 12, fontFamily: 'system-ui' }}>No reactions match &ldquo;{reactionsQuery}&rdquo;</div>}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '3px 12px', flexShrink: 0, background: 'var(--bg-secondary)', borderTop: '1px solid var(--border-color)', fontSize: 9, color: 'var(--text-muted)', fontFamily: 'system-ui' }}>
+          <span>{filtered.length} reactions shown</span>
+          <span style={{ marginLeft: 'auto', opacity: 0.55 }}>Click row to inspect &middot; hover for edit/delete</span>
         </div>
       </div>
     );
@@ -1230,7 +1699,6 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
   const renderMetabolitesTab = () => {
     const allMets = currentModel?.metabolites || {};
     const allRxns = currentModel?.reactions || {};
-    const metReactionCount = useMemo ? null : null; // computed inline
     const qlo = metQuery.toLowerCase();
     const rows = Object.entries(allMets).map(([id, met]) => {
       const rxnCount = Object.values(allRxns).filter(r => id in (r.metabolites || {})).length;
@@ -1240,47 +1708,79 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
       r.id.toLowerCase().includes(qlo) || r.name.toLowerCase().includes(qlo) ||
       r.formula.toLowerCase().includes(qlo) || r.compartment.toLowerCase().includes(qlo)
     ) : rows;
+    const maxRxnCount = Math.max(1, ...rows.map(r => r.rxnCount));
     const COMP_COLOR = { c:'#3b82f6', e:'#f59e0b', p:'#10b981', m:'#8b5cf6', x:'#ef4444', n:'#6366f1' };
 
+    const MC = {
+      id:   { accent: '#22c55e', hdr: isDark ? '#052e16' : '#f0fdf4', txt: isDark ? '#4ade80' : '#166534' },
+      name: { accent: '#3b82f6', hdr: isDark ? '#0c1a3a' : '#eff6ff', txt: isDark ? '#93c5fd' : '#1e40af' },
+      fml:  { accent: '#a855f7', hdr: isDark ? '#1e0a3c' : '#faf5ff', txt: isDark ? '#d8b4fe' : '#6b21a8' },
+      cmp:  { accent: '#f97316', hdr: isDark ? '#2c0a00' : '#fff7ed', txt: isDark ? '#fdba74' : '#9a3412' },
+      rxn:  { accent: '#6366f1', hdr: isDark ? '#0f172a' : '#eef2ff', txt: isDark ? '#a5b4fc' : '#4338ca' },
+    };
+    const th = (col, label) => (
+      <th style={{ padding: '5px 8px', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.09em', background: MC[col].hdr, color: MC[col].txt, borderRight: `1.5px solid ${MC[col].accent}44`, borderBottom: `2.5px solid ${MC[col].accent}99`, whiteSpace: 'nowrap', userSelect: 'none', textAlign: 'left' }}>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+          <span style={{ width: 6, height: 6, borderRadius: '50%', background: MC[col].accent, opacity: 0.7, flexShrink: 0, display: 'inline-block' }} />
+          {label}
+        </span>
+      </th>
+    );
+    const rowBg = i => i % 2 === 0 ? (isDark ? '#0f172a' : '#ffffff') : (isDark ? '#1e293b' : '#f8fafc');
+    const tdB = col => ({ borderRight: `1.5px solid ${MC[col].accent}22` });
+
     return (
-      <div className="flex flex-col">
-        <div className="flex items-center gap-3 px-4 py-2.5 border-b border-[var(--border-color)] bg-[var(--bg-secondary)]">
-          <input value={metQuery} onChange={e => setMetQuery(e.target.value)}
-            placeholder="Search by ID, name, formula, compartment…"
-            className="flex-1 min-w-64 px-3 py-1.5 text-sm rounded-lg border border-[var(--border-color)] bg-[var(--bg-primary)] text-[var(--text-primary)] placeholder-[var(--text-muted)] focus:outline-none focus:ring-1 focus:ring-[var(--primary)]" />
-          <span className="text-xs text-[var(--text-muted)]">{filtered.length} / {rows.length} metabolites</span>
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px', flexShrink: 0, background: isDark ? '#0d1726' : '#f1f5f9', borderBottom: '1px solid var(--border-color)' }}>
+          <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-muted)', fontFamily: 'system-ui', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Metabolites</span>
+          <span style={{ fontSize: 9, color: 'var(--text-muted)', fontFamily: 'system-ui' }}><b style={{ color: 'var(--text-secondary)' }}>{filtered.length}</b> / {rows.length}</span>
+          <input value={metQuery} onChange={e => setMetQuery(e.target.value)} placeholder="Filter by ID, name, formula, compartment…"
+            style={{ marginLeft: 'auto', fontSize: 9, padding: '3px 8px', border: '1px solid var(--border-color)', borderRadius: 2, background: isDark ? '#1e293b' : '#fff', color: 'var(--text-secondary)', width: 240, fontFamily: 'system-ui' }} />
         </div>
-        <div className="overflow-auto">
-          <table className="w-full text-sm border-collapse">
-            <thead className="bg-[var(--bg-secondary)]">
-              <tr className="text-left text-xs text-[var(--text-muted)] border-b border-[var(--border-color)]">
-                <th className="px-3 py-2 font-medium w-44">ID</th>
-                <th className="px-3 py-2 font-medium">Name</th>
-                <th className="px-3 py-2 font-medium w-32">Formula</th>
-                <th className="px-3 py-2 font-medium w-28">Compartment</th>
-                <th className="px-3 py-2 font-medium w-24">Reactions</th>
+        <div style={{ flex: 1, overflowY: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
+            <colgroup>
+              <col style={{ width: 160 }} /><col /><col style={{ width: 120 }} />
+              <col style={{ width: 110 }} /><col style={{ width: 130 }} />
+            </colgroup>
+            <thead style={{ position: 'sticky', top: 0, zIndex: 10 }}>
+              <tr>
+                {th('id',   'Metabolite ID')}
+                {th('name', 'Name')}
+                {th('fml',  'Formula')}
+                {th('cmp',  'Compartment')}
+                {th('rxn',  'Reactions')}
               </tr>
             </thead>
             <tbody>
-              {filtered.map(row => (
-                <tr key={row.id} className="border-b border-[var(--border-color)] hover:bg-[var(--bg-secondary)] transition-colors">
-                  <td className="px-3 py-2 font-mono text-xs text-[var(--text-primary)]">{row.id}</td>
-                  <td className="px-3 py-2 text-xs text-[var(--text-secondary)]">{row.name || '—'}</td>
-                  <td className="px-3 py-2 font-mono text-xs text-[var(--text-muted)]">{row.formula || '—'}</td>
-                  <td className="px-3 py-2 text-xs">
+              {filtered.map((row, i) => (
+                <tr key={row.id} style={{ background: rowBg(i), borderBottom: `1px solid ${isDark ? '#1e293b' : '#e2e8f0'}` }}>
+                  <td style={{ padding: '5px 8px', fontSize: 9, fontFamily: 'var(--font-mono)', color: MC.id.accent, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', ...tdB('id') }}>{row.id}</td>
+                  <td style={{ padding: '5px 8px', fontSize: 9, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', ...tdB('name') }}>{row.name || '—'}</td>
+                  <td style={{ padding: '5px 8px', fontSize: 9, fontFamily: 'var(--font-mono)', color: MC.fml.accent, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', ...tdB('fml') }}>{row.formula || '—'}</td>
+                  <td style={{ padding: '5px 8px', fontSize: 9, ...tdB('cmp') }}>
                     {row.compartment ? (
-                      <span className="inline-flex items-center gap-1">
-                        <span className="w-2 h-2 rounded-full" style={{ background: COMP_COLOR[row.compartment] || '#94a3b8' }} />
-                        <span className="text-[var(--text-secondary)]">{row.compartment}</span>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                        <span style={{ width: 8, height: 8, borderRadius: '50%', background: COMP_COLOR[row.compartment] || '#94a3b8', flexShrink: 0 }} />
+                        <span style={{ color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)', fontSize: 9 }}>{row.compartment}</span>
                       </span>
-                    ) : '—'}
+                    ) : <span style={{ color: 'var(--text-muted)' }}>—</span>}
                   </td>
-                  <td className="px-3 py-2 text-xs text-[var(--text-muted)]">{row.rxnCount}</td>
+                  <td style={{ padding: '5px 8px', fontSize: 9, ...tdB('rxn') }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <div style={{ width: Math.round((row.rxnCount / maxRxnCount) * 56), height: 4, background: `linear-gradient(90deg, ${MC.rxn.accent}cc, ${MC.rxn.accent}44)`, borderRadius: 2, flexShrink: 0 }} />
+                      <span style={{ fontSize: 9, fontFamily: 'var(--font-mono)', color: MC.rxn.txt, minWidth: 20 }}>{row.rxnCount}</span>
+                    </div>
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
-          {filtered.length === 0 && <div className="text-center py-12 text-[var(--text-muted)] text-sm">No metabolites match "{metQuery}"</div>}
+          {filtered.length === 0 && <div style={{ textAlign: 'center', padding: '48px 0', color: 'var(--text-muted)', fontSize: 12, fontFamily: 'system-ui' }}>No metabolites match &ldquo;{metQuery}&rdquo;</div>}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '3px 12px', flexShrink: 0, background: 'var(--bg-secondary)', borderTop: '1px solid var(--border-color)', fontSize: 9, color: 'var(--text-muted)', fontFamily: 'system-ui' }}>
+          <span>{filtered.length} metabolites shown</span>
+          <span style={{ marginLeft: 'auto', opacity: 0.55 }}>Bar width = reaction participation count</span>
         </div>
       </div>
     );
@@ -1304,44 +1804,74 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
     const filtered = qlo ? rows.filter(r =>
       r.id.toLowerCase().includes(qlo) || r.name.toLowerCase().includes(qlo)
     ) : rows;
+    const maxRxns = Math.max(1, ...rows.map(r => r.rxns.length));
+
+    const GC = {
+      id:   { accent: '#22c55e', hdr: isDark ? '#052e16' : '#f0fdf4', txt: isDark ? '#4ade80' : '#166534' },
+      name: { accent: '#3b82f6', hdr: isDark ? '#0c1a3a' : '#eff6ff', txt: isDark ? '#93c5fd' : '#1e40af' },
+      cnt:  { accent: '#eab308', hdr: isDark ? '#2d1b00' : '#fefce8', txt: isDark ? '#fde68a' : '#854d0e' },
+      rxns: { accent: '#6366f1', hdr: isDark ? '#0f172a' : '#eef2ff', txt: isDark ? '#a5b4fc' : '#4338ca' },
+    };
+    const th = (col, label) => (
+      <th style={{ padding: '5px 8px', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.09em', background: GC[col].hdr, color: GC[col].txt, borderRight: `1.5px solid ${GC[col].accent}44`, borderBottom: `2.5px solid ${GC[col].accent}99`, whiteSpace: 'nowrap', userSelect: 'none', textAlign: 'left' }}>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+          <span style={{ width: 6, height: 6, borderRadius: '50%', background: GC[col].accent, opacity: 0.7, flexShrink: 0, display: 'inline-block' }} />
+          {label}
+        </span>
+      </th>
+    );
+    const rowBg = i => i % 2 === 0 ? (isDark ? '#0f172a' : '#ffffff') : (isDark ? '#1e293b' : '#f8fafc');
+    const tdB = col => ({ borderRight: `1.5px solid ${GC[col].accent}22` });
 
     return (
-      <div className="flex flex-col">
-        <div className="flex items-center gap-3 px-4 py-2.5 border-b border-[var(--border-color)] bg-[var(--bg-secondary)]">
-          <input value={geneQuery} onChange={e => setGeneQuery(e.target.value)}
-            placeholder="Search by gene ID or name…"
-            className="flex-1 min-w-64 px-3 py-1.5 text-sm rounded-lg border border-[var(--border-color)] bg-[var(--bg-primary)] text-[var(--text-primary)] placeholder-[var(--text-muted)] focus:outline-none focus:ring-1 focus:ring-[var(--primary)]" />
-          <span className="text-xs text-[var(--text-muted)]">{filtered.length} / {rows.length} genes</span>
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px', flexShrink: 0, background: isDark ? '#0d1726' : '#f1f5f9', borderBottom: '1px solid var(--border-color)' }}>
+          <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-muted)', fontFamily: 'system-ui', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Genes</span>
+          <span style={{ fontSize: 9, color: 'var(--text-muted)', fontFamily: 'system-ui' }}><b style={{ color: 'var(--text-secondary)' }}>{filtered.length}</b> / {rows.length}</span>
+          <input value={geneQuery} onChange={e => setGeneQuery(e.target.value)} placeholder="Filter by gene ID or name…"
+            style={{ marginLeft: 'auto', fontSize: 9, padding: '3px 8px', border: '1px solid var(--border-color)', borderRadius: 2, background: isDark ? '#1e293b' : '#fff', color: 'var(--text-secondary)', width: 200, fontFamily: 'system-ui' }} />
         </div>
-        <div className="overflow-auto">
-          <table className="w-full text-sm border-collapse">
-            <thead className="bg-[var(--bg-secondary)]">
-              <tr className="text-left text-xs text-[var(--text-muted)] border-b border-[var(--border-color)]">
-                <th className="px-3 py-2 font-medium w-36">Gene ID</th>
-                <th className="px-3 py-2 font-medium w-40">Name</th>
-                <th className="px-3 py-2 font-medium w-20">Rxns</th>
-                <th className="px-3 py-2 font-medium">Associated Reactions</th>
+        <div style={{ flex: 1, overflowY: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
+            <colgroup>
+              <col style={{ width: 140 }} /><col style={{ width: 160 }} /><col style={{ width: 110 }} /><col />
+            </colgroup>
+            <thead style={{ position: 'sticky', top: 0, zIndex: 10 }}>
+              <tr>
+                {th('id',   'Gene ID')}
+                {th('name', 'Product / Name')}
+                {th('cnt',  'Rxn count')}
+                {th('rxns', 'Associated Reactions')}
               </tr>
             </thead>
             <tbody>
-              {filtered.map(row => (
-                <tr key={row.id} className="border-b border-[var(--border-color)] hover:bg-[var(--bg-secondary)] transition-colors">
-                  <td className="px-3 py-2 font-mono text-xs font-medium text-[var(--text-primary)]">{row.id}</td>
-                  <td className="px-3 py-2 text-xs text-[var(--text-secondary)]">{row.name || '—'}</td>
-                  <td className="px-3 py-2 text-xs text-[var(--text-muted)]">{row.rxns.length}</td>
-                  <td className="px-3 py-2 text-xs text-[var(--text-muted)]">
-                    <div className="flex flex-wrap gap-1">
+              {filtered.map((row, i) => (
+                <tr key={row.id} style={{ background: rowBg(i), borderBottom: `1px solid ${isDark ? '#1e293b' : '#e2e8f0'}` }}>
+                  <td style={{ padding: '5px 8px', fontSize: 9, fontFamily: 'var(--font-mono)', color: GC.id.accent, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', ...tdB('id') }}>{row.id}</td>
+                  <td style={{ padding: '5px 8px', fontSize: 9, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', ...tdB('name') }}>{row.name !== row.id ? row.name : '—'}</td>
+                  <td style={{ padding: '5px 8px', fontSize: 9, ...tdB('cnt') }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <div style={{ width: Math.max(2, Math.round((row.rxns.length / maxRxns) * 52)), height: 4, background: `linear-gradient(90deg, ${GC.cnt.accent}cc, ${GC.cnt.accent}44)`, borderRadius: 2, flexShrink: 0 }} />
+                      <span style={{ fontSize: 9, fontFamily: 'var(--font-mono)', color: GC.cnt.txt }}>{row.rxns.length}</span>
+                    </div>
+                  </td>
+                  <td style={{ padding: '5px 8px', fontSize: 9, ...tdB('rxns') }}>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3 }}>
                       {row.rxns.slice(0, 8).map(r => (
-                        <span key={r} className="px-1.5 py-0.5 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded font-mono text-[10px]">{r}</span>
+                        <span key={r} style={{ padding: '1px 5px', background: isDark ? '#1e293b' : '#f1f5f9', border: `1px solid ${GC.rxns.accent}44`, borderRadius: 2, fontFamily: 'var(--font-mono)', fontSize: 8.5, color: GC.rxns.txt }}>{r}</span>
                       ))}
-                      {row.rxns.length > 8 && <span className="text-[var(--text-muted)] text-[10px]">+{row.rxns.length - 8} more</span>}
+                      {row.rxns.length > 8 && <span style={{ fontSize: 8.5, color: 'var(--text-muted)' }}>+{row.rxns.length - 8} more</span>}
                     </div>
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
-          {filtered.length === 0 && <div className="text-center py-12 text-[var(--text-muted)] text-sm">No genes match "{geneQuery}"</div>}
+          {filtered.length === 0 && <div style={{ textAlign: 'center', padding: '48px 0', color: 'var(--text-muted)', fontSize: 12, fontFamily: 'system-ui' }}>No genes match &ldquo;{geneQuery}&rdquo;</div>}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '3px 12px', flexShrink: 0, background: 'var(--bg-secondary)', borderTop: '1px solid var(--border-color)', fontSize: 9, color: 'var(--text-muted)', fontFamily: 'system-ui' }}>
+          <span>{filtered.length} genes shown</span>
+          <span style={{ marginLeft: 'auto', opacity: 0.55 }}>Bar width = reaction associations &middot; Indigo tags = linked reactions</span>
         </div>
       </div>
     );
@@ -1388,6 +1918,42 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
         btnLabel: 'Download .svg',
         note: null,
         color: '#8b5cf6',
+      },
+      {
+        icon: '⬡',
+        title: 'Metabolites CSV',
+        desc: `Exports all ${metCount} metabolites with ID, name, molecular formula, compartment, and charge. Use for metabolite annotation curation in Excel or Python/pandas.`,
+        action: exportMetabolitesCSV,
+        btnLabel: 'Download .csv',
+        note: null,
+        color: '#a855f7',
+      },
+      {
+        icon: 'ψ',
+        title: 'Genes / GPR Table CSV',
+        desc: `Exports all ${Object.keys(m?.genes || {}).length} genes with product name, reaction count, full list of associated reaction IDs, and an example GPR rule. Useful for GPR curation before re-import.`,
+        action: exportGenesCSV,
+        btnLabel: 'Download .csv',
+        note: null,
+        color: '#22c55e',
+      },
+      {
+        icon: 'S',
+        title: 'Stoichiometric Matrix CSV',
+        desc: `Exports the full S-matrix (${metCount} metabolites × ${rxnCount} reactions). Rows = metabolites, columns = reactions, values = stoichiometric coefficients. Required by MATLAB COBRA Toolbox and Python-based solvers.`,
+        action: exportSmatrixCSV,
+        btnLabel: 'Download .csv',
+        note: `Warning: file will be ~${Math.round(metCount * rxnCount * 2 / 1024)}KB. Large models may take a few seconds to generate.`,
+        color: '#f97316',
+      },
+      {
+        icon: 'f',
+        title: 'FBA Flux Results CSV',
+        desc: `Exports the current flux vector — reaction ID, flux value, bounds, subsystem, GPR, and active flag — for all ${rxnCount} reactions. Run FBA in the FBA tab first to populate values.`,
+        action: exportFluxCSV,
+        btnLabel: 'Download .csv',
+        note: Object.keys(fluxes).length === 0 ? 'No FBA results yet — go to the FBA tab and run a solve first.' : `${Object.values(fluxes).filter(v => Math.abs(v) > 1e-6).length} active fluxes ready for export.`,
+        color: '#6366f1',
       },
     ];
 
@@ -1504,7 +2070,7 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
           </div>
 
           {viewLevel === 'categories' && renderModelDashboard()}
-          {viewLevel === 'categories' && renderTreemap()}
+          {viewLevel === 'categories' && renderCategoryBar()}
           {viewLevel === 'categories' && renderCategoryCards()}
           {viewLevel === 'categories' && renderDashboardFooter()}
           {viewLevel === 'subsystems' && renderSubsystemList()}
@@ -1544,6 +2110,7 @@ const SubsystemView = ({ fluxes = {}, phenotype = null, width = 1000, height = 7
       {activeTab === 'metabolites' && renderMetabolitesTab()}
       {activeTab === 'genes'       && renderGenesTab()}
       {activeTab === 'export'      && renderExportTab()}
+      {activeTab === 'fba'         && <FBAStudioTab onFluxUpdate={onFluxUpdate} />}
     </div>
   );
 };

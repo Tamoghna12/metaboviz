@@ -98,7 +98,7 @@ export class UncertaintyResult {
  * @param {Object} uncertaintyConfig - Uncertainty configuration
  * @returns {Object} Model with perturbed bounds
  */
-function sampleParameterUncertainty(model, uncertaintyConfig) {
+export function sampleParameterUncertainty(model, uncertaintyConfig) {
   const {
     boundUncertainty = 0.1,  // ±10% uncertainty on bounds
     rng = Math.random,       // RNG function (seeded or Math.random)
@@ -144,7 +144,7 @@ function sampleParameterUncertainty(model, uncertaintyConfig) {
  * @param {number} confidenceLevel - Confidence level (default: 0.95)
  * @returns {Object} Confidence interval statistics
  */
-function computeConfidenceInterval(samples, confidenceLevel = 0.95) {
+export function computeConfidenceInterval(samples, confidenceLevel = 0.95) {
   if (!samples || samples.length === 0) {
     return {
       mean: null,
@@ -196,7 +196,7 @@ function computeConfidenceInterval(samples, confidenceLevel = 0.95) {
  * @param {number} tolerance - Convergence tolerance
  * @returns {boolean} Whether convergence is achieved
  */
-function checkConvergence(cumulativeMeans, tolerance = 0.01) {
+export function checkConvergence(cumulativeMeans, tolerance = 0.01) {
   if (cumulativeMeans.length < 10) {
     return false;  // Need minimum samples
   }
@@ -596,25 +596,3 @@ export function compareUncertainty(conditionA, conditionB) {
   return comparison;
 }
 
-// Named exports for testing
-export {
-  solveUncertaintyFBA,
-  solveFVAForUncertainty,
-  identifyHighUncertaintyReactions,
-  compareUncertainty,
-  computeConfidenceInterval,
-  checkConvergence,
-  sampleParameterUncertainty,
-  UncertaintyResult,
-};
-
-export default {
-  solveUncertaintyFBA,
-  solveFVAForUncertainty,
-  identifyHighUncertaintyReactions,
-  compareUncertainty,
-  computeConfidenceInterval,
-  checkConvergence,
-  sampleParameterUncertainty,
-  UncertaintyResult,
-};

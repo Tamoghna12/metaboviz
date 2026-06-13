@@ -2,13 +2,23 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Development Commands
+## Starting the Application
+
+**Quick start (from this directory):**
+```bash
+npm install        # first time only
+npm run dev        # starts at http://localhost:5173 (auto-increments if port is taken)
+```
+
+Open the printed URL in a browser. Drag-and-drop an SBML (.xml) or COBRApy JSON (.json) model file onto the landing page to load it.
 
 **Build & Development:**
-- `npm run dev` - Start Vite dev server with HMR (http://localhost:5173)
-- `npm run build` - Create production bundle in dist/
-- `npm run preview` - Preview built app locally
-- `npm run lint` - Run ESLint (flat config, no TypeScript)
+- `npm run dev` — Start Vite dev server with HMR (http://localhost:5173)
+- `npm run build` — Create production bundle in `dist/`
+- `npm run preview` — Preview the built app locally (serves `dist/`)
+- `npm run lint` — Run ESLint (flat config, no TypeScript)
+
+**If port 5173 is already in use** (multiple dev servers running), Vite auto-picks the next available port (5174, 5175, …). Check the terminal output for the actual URL.
 
 **Test & Quality:**
 - No automated test suite currently configured. Manual testing is done via dev server or preview.
@@ -43,6 +53,21 @@ MetabolicSuite is an interactive educational platform for constraint-based metab
 - `src/index.css` - Tailwind + CSS custom properties for theming
 - `src/App.css` - Minimal app-specific styles
 - `postcss.config.js` & Tailwind v4 configuration included
+
+### Toolbar Features (integration status)
+
+All buttons are in `ModelVisualizerApp.jsx`. Each is mutually exclusive (toggling one closes others).
+
+| Button | Component | Status |
+|---|---|---|
+| Live Flux | `LiveFluxCanvas.jsx` | ✅ Real — Escher-style canvas, bezier edges, flux-width encoding |
+| Compare | `CompareView.jsx` | ✅ Real — parallel FBA on two models, structural diff |
+| Validate | `ValidationPanel.jsx` | ✅ Real — reproduces Orth 2010 / Feist 2007 reference values |
+| Gene KO | `EssentialGenePanel.jsx` | ✅ Real — FBA loop over all genes, classifies essential/non-essential |
+| Phase Plane | `PhasePlanePanel.jsx` | ✅ Real — 2D FBA sweep over two exchange fluxes |
+| Media Analysis | `GapFillPanel.jsx` | ⚠️ Partial — FBA-based minimal media + blocked reaction scan; true MILP gap-filling not implemented client-side |
+
+The **Uncertainty** button was removed — its panel had no computation behind it (UI stub only).
 
 ### Key Architectural Decisions
 

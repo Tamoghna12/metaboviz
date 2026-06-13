@@ -15,6 +15,8 @@
 
 import {
   SOLVER_TOLERANCE,
+  OBJECTIVE_TOLERANCE,
+  FLUX_TOLERANCE,
   DEFAULT_VIABILITY_THRESHOLD,
   IMAT_EPSILON,
   findObjectiveReaction,
@@ -26,7 +28,7 @@ import {
   formatSplitResult,
 } from './MetabolicLP.js';
 
-export { SOLVER_TOLERANCE, DEFAULT_VIABILITY_THRESHOLD };
+export { SOLVER_TOLERANCE, OBJECTIVE_TOLERANCE, FLUX_TOLERANCE, DEFAULT_VIABILITY_THRESHOLD, IMAT_EPSILON };
 
 // ── HiGHS initialization ──────────────────────────────────────────────────────
 

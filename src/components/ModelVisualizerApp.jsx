@@ -1,28 +1,32 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
-import { Upload, X, Database, GitBranch, FlaskConical, Dna, Sun, Moon, Eye, Download, Zap, Layers, BarChart2, ArrowRight, ArrowLeftRight, Globe, Terminal } from 'lucide-react';
+import { Upload, X, Database, GitBranch, FlaskConical, Dna, Sun, Moon, Eye, Download, Zap, Layers, BarChart2, ArrowRight, ArrowLeftRight, Globe, Terminal, Activity } from 'lucide-react';
 import { useModel } from '../contexts/ModelContext';
 import { useTheme } from '../contexts/ThemeContext';
 import SubsystemView from './SubsystemView';
 import FBAPanel from './FBAPanel';
 import CompareView from './CompareView';
+import ValidationPanel from './ValidationPanel';
+import EssentialGenePanel from './EssentialGenePanel';
+import PhasePlanePanel from './PhasePlanePanel';
+import GapFillPanel from './GapFillPanel';
+import LiveFluxCanvas from './LiveFluxCanvas';
 import KernelPanel, { useKernelCells } from './KernelPanel';
 import { KernelStatus } from '../lib/KernelSolver';
 import { computeManager } from '../lib/ComputeWorker';
 
-// ── Stat Pill ─────────────────────────────────────────────────────────────────
-function StatPill({ icon: Icon, value, label, colorVar }) {
+// ── Stat Pill — flat monochrome ───────────────────────────────────────────────
+function StatPill({ value, label }) {
   return (
-    <div
-      className="stat-pill"
-      style={{
-        background: `color-mix(in srgb, var(${colorVar}) 12%, transparent)`,
-        color: `var(${colorVar})`,
-        border: `1px solid color-mix(in srgb, var(${colorVar}) 28%, transparent)`,
-      }}
-    >
-      <Icon style={{ width: 10, height: 10 }} />
-      <span>{value}</span>
-      <span style={{ opacity: 0.65 }}>{label}</span>
+    <div style={{
+      display: 'inline-flex', alignItems: 'center', gap: 4,
+      padding: '1px 8px', borderRadius: 2,
+      border: '1px solid var(--border-color)',
+      background: 'var(--bg-secondary)',
+      fontSize: 10, fontFamily: 'var(--font-mono)',
+      color: 'var(--text-secondary)', userSelect: 'none',
+    }}>
+      <span style={{ fontWeight: 600 }}>{value}</span>
+      <span style={{ color: 'var(--text-muted)' }}>{label}</span>
     </div>
   );
 }
@@ -249,7 +253,7 @@ const DATABASES = ['BIGG Models', 'BioModels', 'MetaNetX', 'BioCyc', 'KEGG', 'CO
 // ── Landing page (before model loaded) ───────────────────────────────────────
 function UploadLanding({ onActivate }) {
   const { loadModel, loading, error, selectModel, availableModels } = useModel();
-  const { isDark } = useTheme();
+  const { isDark: _isDark } = useTheme();
   const [dragActive, setDragActive] = useState(false);
   const fileInputRef = useRef(null);
   const uploadRef    = useRef(null);
@@ -359,7 +363,7 @@ function UploadLanding({ onActivate }) {
             style={{ color: 'var(--text-muted)', letterSpacing: '0.1em' }}>Capabilities</p>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3"
             style={{ border: '1px solid var(--border-color)', borderRadius: 3, overflow: 'hidden' }}>
-            {FEATURES.map(({ icon: Icon, tag, title, desc }, i) => (
+            {FEATURES.map(({ tag, title, desc }, i) => (
               <div key={title} className="p-5"
                 style={{
                   background: 'var(--bg-secondary)',
@@ -367,7 +371,6 @@ function UploadLanding({ onActivate }) {
                   borderBottom: i < FEATURES.length - 3 ? '1px solid var(--border-color)' : 'none',
                 }}>
                 <div className="flex items-center gap-2 mb-3">
-                  <Icon className="w-3.5 h-3.5" style={{ color: 'var(--text-muted)' }} />
                   <span className="text-xs" style={{ color: 'var(--text-muted)' }}>{tag}</span>
                 </div>
                 <p className="text-sm font-medium mb-1.5" style={{ color: 'var(--text-primary)' }}>{title}</p>
@@ -474,14 +477,19 @@ export default function ModelVisualizerApp() {
   const { isLight, toggleTheme, colorBlindMode, toggleColorBlindMode } = useTheme();
   const [selectedReaction, setSelectedReaction] = useState(null);
   const [modelActive, setModelActive]           = useState(false);
-  const [showFBA, setShowFBA]                   = useState(false);
+  const [_showFBA, setShowFBA]                  = useState(false);
   const [showKernel, setShowKernel]             = useState(false);
   const [kernelStatus, setKernelStatus]         = useState(KernelStatus.DISCONNECTED);
   const [fluxes, setFluxes]                     = useState({});
-  const [phenotype, setPhenotype]               = useState(null);
+  const [phenotype, _setPhenotype]              = useState(null);
   const [compareMode, setCompareMode]           = useState(false);
+  const [showValidation, setShowValidation]     = useState(false);
+  const [showGeneKO, setShowGeneKO]             = useState(false);
+  const [showPhasePlane, setShowPhasePlane]     = useState(false);
+  const [showGapFill, setShowGapFill]           = useState(false);
+  const [showLiveFlux, setShowLiveFlux]         = useState(false);
   const fileInputRef = useRef(null);
-  const { cells: kernelCells, onCellAdded } = useKernelCells();
+  const { cells: kernelCells } = useKernelCells();
 
   useEffect(() => {
     const unsub = computeManager.kernelSolver.onStatusChange(s => setKernelStatus(s));
@@ -524,9 +532,9 @@ export default function ModelVisualizerApp() {
               {modelName}
             </span>
             <div className="flex items-center gap-1">
-              <StatPill icon={Database}     value={rxnCount}  label="rxns"  colorVar="--reaction-color"  />
-              <StatPill icon={FlaskConical}  value={metCount}  label="mets"  colorVar="--metabolite-color" />
-              {geneCount > 0 && <StatPill icon={Dna} value={geneCount} label="genes" colorVar="--gene-color" />}
+              <StatPill value={rxnCount}  label="rxns"  />
+              <StatPill value={metCount}  label="mets"  />
+              {geneCount > 0 && <StatPill value={geneCount} label="genes" />}
             </div>
           </>
         )}
@@ -536,16 +544,41 @@ export default function ModelVisualizerApp() {
             <>
               {[
                 {
+                  label: 'Live Flux', icon: <Activity className="w-3.5 h-3.5" />,
+                  active: showLiveFlux,
+                  style: showLiveFlux ? { borderColor: '#3b82f6', color: '#60a5fa', background: 'rgba(59,130,246,0.1)' } : {},
+                  onClick: () => { setShowLiveFlux(v => { if (!v) { setShowFBA(false); setCompareMode(false); setShowValidation(false); setShowGeneKO(false); setShowPhasePlane(false); setShowGapFill(false); } return !v; }); },
+                },
+                {
                   label: 'Compare', icon: <ArrowLeftRight className="w-3.5 h-3.5" />,
                   active: compareMode,
-                  onClick: () => { setCompareMode(v => { if (!v) setShowFBA(false); return !v; }); },
+                  onClick: () => { setCompareMode(v => { if (!v) { setShowFBA(false); setShowValidation(false); setShowGeneKO(false); setShowPhasePlane(false); setShowGapFill(false); setShowLiveFlux(false); } return !v; }); },
                 },
-                ...(!compareMode ? [
-                  { label: 'FBA', icon: <Zap className="w-3.5 h-3.5" />, active: showFBA, onClick: () => setShowFBA(v => !v) },
+                {
+                  label: 'Validate', icon: <span style={{ fontSize: 13 }}>✓</span>,
+                  active: showValidation,
+                  onClick: () => { setShowValidation(v => { if (!v) { setShowFBA(false); setCompareMode(false); setShowGeneKO(false); setShowPhasePlane(false); setShowGapFill(false); setShowLiveFlux(false); } return !v; }); },
+                },
+                {
+                  label: 'Gene KO', icon: <Dna className="w-3.5 h-3.5" />,
+                  active: showGeneKO,
+                  onClick: () => { setShowGeneKO(v => { if (!v) { setShowFBA(false); setCompareMode(false); setShowValidation(false); setShowPhasePlane(false); setShowGapFill(false); setShowLiveFlux(false); } return !v; }); },
+                },
+                {
+                  label: 'Phase Plane', icon: <BarChart2 className="w-3.5 h-3.5" />,
+                  active: showPhasePlane,
+                  onClick: () => { setShowPhasePlane(v => { if (!v) { setShowFBA(false); setCompareMode(false); setShowValidation(false); setShowGeneKO(false); setShowGapFill(false); setShowLiveFlux(false); } return !v; }); },
+                },
+                {
+                  label: 'Media Analysis', icon: <FlaskConical className="w-3.5 h-3.5" />,
+                  active: showGapFill,
+                  onClick: () => { setShowGapFill(v => { if (!v) { setShowFBA(false); setCompareMode(false); setShowValidation(false); setShowGeneKO(false); setShowPhasePlane(false); setShowLiveFlux(false); } return !v; }); },
+                },
+                ...(!compareMode && !showValidation && !showGeneKO && !showPhasePlane && !showGapFill && !showLiveFlux ? [
                   { label: 'Kernel', active: showKernel, onClick: () => setShowKernel(v => !v),
                     icon: <><Terminal className="w-3.5 h-3.5" />{kernelStatus === KernelStatus.CONNECTED && <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: 'var(--success)' }} />}</> },
                 ] : []),
-              ].map(({ label, icon, active, onClick }) => (
+              ].map(({ label, icon, active, onClick, style: extraStyle }) => (
                 <button key={label} onClick={onClick}
                   className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors"
                   style={{
@@ -553,6 +586,7 @@ export default function ModelVisualizerApp() {
                     borderRadius: 3,
                     background: active ? 'var(--bg-tertiary)' : 'transparent',
                     color: active ? 'var(--text-primary)' : 'var(--text-muted)',
+                    ...extraStyle,
                   }}
                   onMouseEnter={e => { e.currentTarget.style.color = 'var(--text-primary)'; e.currentTarget.style.borderColor = 'var(--text-muted)'; }}
                   onMouseLeave={e => { e.currentTarget.style.color = active ? 'var(--text-primary)' : 'var(--text-muted)'; e.currentTarget.style.borderColor = 'var(--border-color)'; }}
@@ -601,16 +635,27 @@ export default function ModelVisualizerApp() {
           <UploadLanding onActivate={() => setModelActive(true)} />
         ) : compareMode ? (
           <CompareView onClose={() => setCompareMode(false)} />
+        ) : showValidation ? (
+          <ValidationPanel onClose={() => setShowValidation(false)} />
+        ) : showGeneKO ? (
+          <EssentialGenePanel onClose={() => setShowGeneKO(false)} />
+        ) : showPhasePlane ? (
+          <PhasePlanePanel onClose={() => setShowPhasePlane(false)} />
+        ) : showLiveFlux ? (
+          <LiveFluxCanvas onClose={() => setShowLiveFlux(false)} />
+        ) : showGapFill ? (
+          <GapFillPanel onClose={() => setShowGapFill(false)} />
         ) : (
           <>
             <div className="flex-1 flex min-h-0">
               <div className="flex-1 overflow-hidden">
                 <SubsystemView
                   width={selectedReaction ? window.innerWidth - 288 : window.innerWidth}
-                  height={showFBA ? window.innerHeight - 56 - 148 : window.innerHeight - 56}
+                  height={window.innerHeight - 56}
                   onReactionSelect={handleReactionSelect}
                   fluxes={fluxes}
                   phenotype={phenotype}
+                  onFluxUpdate={setFluxes}
                 />
               </div>
               {selectedReaction && (
@@ -626,14 +671,6 @@ export default function ModelVisualizerApp() {
                 />
               )}
             </div>
-            {showFBA && (
-              <FBAPanel
-                onFluxUpdate={setFluxes}
-                onPhenotypeUpdate={p => { setPhenotype(p); }}
-                onClose={() => { setShowFBA(false); setFluxes({}); setPhenotype(null); }}
-                onCellAdded={onCellAdded}
-              />
-            )}
           </>
         )}
       </div>

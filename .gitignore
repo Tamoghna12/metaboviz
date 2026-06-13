@@ -22,3 +22,11 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Build / tooling caches
+.vite/
+graphify-out/
+
+# Python caches
+__pycache__/
+*.py[cod]

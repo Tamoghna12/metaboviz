@@ -54,10 +54,12 @@ function FluxBar({ value, maxAbs, width = 72 }) {
 
 // FVA range bar: shows [min, max] span on a symmetric axis
 function FVARangeBar({ min, max, absMax, width = 100 }) {
-  if (absMax === 0 || min === null || max === null) {
+  if (absMax === 0 || absMax === Infinity || min === null || max === null) {
     return <span style={{ display: 'inline-block', width, height: 10 }} />;
   }
-  const scale = v => Math.min(Math.max(v / absMax, -1), 1);
+  // Clamp ±Infinity to ±absMax so finite absMax always yields valid px values
+  const clamp = v => (v === Infinity ? absMax : v === -Infinity ? -absMax : v);
+  const scale = v => Math.min(Math.max(clamp(v) / absMax, -1), 1);
   const center = width / 2;
   const lo = scale(min) * (width / 2);
   const hi = scale(max) * (width / 2);
@@ -324,7 +326,11 @@ export default function FBAPanel({ onFluxUpdate, onClose, onPhenotypeUpdate, onC
   }, [result, objective]);
 
   const fvaAbsMax = useMemo(() =>
-    fvaRows.reduce((m, r) => Math.max(m, Math.abs(r.min ?? 0), Math.abs(r.max ?? 0)), 1e-9),
+    fvaRows.reduce((m, r) => {
+      const lo = isFinite(r.min) ? Math.abs(r.min) : 0;
+      const hi = isFinite(r.max) ? Math.abs(r.max) : 0;
+      return Math.max(m, lo, hi);
+    }, 1e-9),
   [fvaRows]);
 
   const isOptimal   = result?.status?.toLowerCase() === 'optimal';
@@ -354,27 +360,34 @@ export default function FBAPanel({ onFluxUpdate, onClose, onPhenotypeUpdate, onC
   const inputCls = 'w-full text-[10px] px-2 py-0.5 border bg-[var(--bg-primary)] text-[var(--text-primary)] font-mono focus:outline-none focus:ring-1 focus:ring-[var(--primary)]';
   const numCls   = 'w-[68px] text-[10px] px-1.5 py-0.5 border bg-[var(--bg-primary)] text-[var(--text-primary)] font-mono text-right focus:outline-none focus:ring-1 focus:ring-[var(--primary)]';
   const thCls    = 'text-[9px] font-semibold uppercase tracking-widest text-left px-2 py-1.5 select-none';
-  const trBase   = 'grid items-center hover:bg-[var(--bg-primary)] transition-colors';
+  // Excel-like rows: full cell borders, alternating fill
+  const trBase   = 'grid items-center transition-colors';
+  const trEven   = { borderBottom: `1px solid ${S.border}`, background: S.bg2 };
+  const trOdd    = { borderBottom: `1px solid ${S.border}`, background: S.bg1 };
   const sectionLabel = 'text-[9px] font-semibold uppercase tracking-[0.12em] px-3 py-1.5 flex items-center gap-1.5';
 
   return (
     <div className="flex flex-col flex-shrink-0 font-mono"
-         style={{ height: panelHeight, background: S.bg2, borderTop: `1px solid ${S.border}` }}>
+         style={{
+           height: panelHeight, background: S.bg1,
+           borderTop: `2px solid var(--primary)`,
+           boxShadow: '0 -2px 12px rgba(0,0,0,0.08)',
+         }}>
 
       {/* ── Resize handle ────────────────────────────────────────────── */}
       <div
         onMouseDown={onResizeStart}
-        style={{
-          height: 4, cursor: 'ns-resize', flexShrink: 0,
-          background: 'transparent',
-          borderTop: `1px solid ${S.border}`,
-        }}
         title="Drag to resize panel"
+        style={{
+          height: 6, cursor: 'ns-resize', flexShrink: 0,
+          background: 'repeating-linear-gradient(90deg, var(--border-color) 0px, var(--border-color) 3px, transparent 3px, transparent 8px)',
+          opacity: 0.5,
+        }}
       />
 
       {/* ── Header toolbar ───────────────────────────────────────────── */}
       <div className="flex items-center gap-1.5 px-2 flex-shrink-0"
-           style={{ height: 30, background: S.bg1, borderBottom: `1px solid ${S.border}` }}>
+           style={{ height: 30, background: S.bg2, borderBottom: `1px solid ${S.border}` }}>
 
         {/* Title */}
         <span className="text-[10px] font-bold tracking-wide font-sans flex items-center gap-1.5" style={{ color: S.secondary }}>
@@ -400,7 +413,7 @@ export default function FBAPanel({ onFluxUpdate, onClose, onPhenotypeUpdate, onC
         </div>
 
         {/* Solve result — inline */}
-        {isOptimal && !phenotypeResult && (
+        {isOptimal && !isFVA && !phenotypeResult && result.objectiveValue != null && (
           <div className="flex items-center gap-2 ml-1">
             <span className="text-[10px] font-bold font-mono" style={{ color: S.primary }}>
               obj = {result.objectiveValue.toFixed(6)}
@@ -414,6 +427,12 @@ export default function FBAPanel({ onFluxUpdate, onClose, onPhenotypeUpdate, onC
               {tierBadge}
             </span>
           </div>
+        )}
+        {isOptimal && isFVA && !phenotypeResult && (
+          <span className="text-[9px] font-sans ml-1" style={{ color: S.muted }}>
+            {Object.keys(result?.ranges ?? {}).length} reactions analyzed
+            {result.solveTime ? ` · ${fmtTime(result.solveTime)}` : ''}
+          </span>
         )}
         {phenotypeResult && (
           <span className="text-[9px] font-sans ml-1" style={{ color: S.muted }}>
@@ -615,10 +634,10 @@ export default function FBAPanel({ onFluxUpdate, onClose, onPhenotypeUpdate, onC
           {/* Scrollable rows */}
           <div className="flex-1 overflow-y-auto">
             {/* Exchange/all rows */}
-            {displayedExchanges.map(id => {
+            {displayedExchanges.map((id, i) => {
               const mod = isModified(id);
               return (
-                <div key={id} className={trBase} style={{ gridTemplateColumns: '1fr 68px 68px 22px', borderBottom: `1px solid ${S.border}` }}>
+                <div key={id} className={trBase} style={{ gridTemplateColumns: '1fr 68px 68px 22px', ...(i % 2 === 0 ? trEven : trOdd) }}>
                   <span className="text-[10px] px-2 truncate" title={id}
                         style={{ color: mod ? S.primary : S.secondary }}>
                     {id}
@@ -641,10 +660,10 @@ export default function FBAPanel({ onFluxUpdate, onClose, onPhenotypeUpdate, onC
             })}
 
             {/* Custom added reactions (shown in all tabs) */}
-            {[...addedRxnIds].map(id => {
+            {[...addedRxnIds].map((id, i) => {
               const mod = isModified(id);
               return (
-                <div key={id} className={trBase} style={{ gridTemplateColumns: '1fr 68px 68px 22px', borderBottom: `1px solid ${S.border}` }}>
+                <div key={id} className={trBase} style={{ gridTemplateColumns: '1fr 68px 68px 22px', ...(i % 2 === 0 ? trEven : trOdd) }}>
                   <span className="text-[10px] px-2 truncate" title={id}
                         style={{ color: S.primary }}>
                     {id}
@@ -758,12 +777,12 @@ export default function FBAPanel({ onFluxUpdate, onClose, onPhenotypeUpdate, onC
 
               {/* Flux rows */}
               <div className="flex-1 overflow-y-auto">
-                {topFluxes.map(([id, v]) => {
+                {topFluxes.map(([id, v], i) => {
                   const fwd  = v > FLUX_TOL;
                   const isObj = id === objective;
                   return (
                     <div key={id} className={trBase}
-                         style={{ gridTemplateColumns: '1fr 74px 80px', borderBottom: `1px solid ${S.border}` }}>
+                         style={{ gridTemplateColumns: '1fr 74px 80px', ...(i % 2 === 0 ? trEven : trOdd) }}>
                       <span className="px-2 text-[10px] truncate" title={`${id}\n${rxnName(id)}`}
                             style={{ color: isObj ? S.primary : S.secondary, fontWeight: isObj ? 700 : 400 }}>
                         {id}
@@ -832,12 +851,12 @@ export default function FBAPanel({ onFluxUpdate, onClose, onPhenotypeUpdate, onC
 
               {/* FVA rows — sorted by span (most variable first) */}
               <div className="flex-1 overflow-y-auto">
-                {fvaRows.map(({ id, min, max, isFixed }) => {
+                {fvaRows.map(({ id, min, max, isFixed }, i) => {
                   const isObj = id === objective;
                   const fmtV = v => (v === -Infinity ? '-∞' : v === Infinity ? '+∞' : (v >= 0 ? '+' : '') + v.toFixed(3));
                   return (
                     <div key={id} className={trBase}
-                         style={{ gridTemplateColumns: '1fr 108px 60px 60px', borderBottom: `1px solid ${S.border}` }}>
+                         style={{ gridTemplateColumns: '1fr 108px 60px 60px', ...(i % 2 === 0 ? trEven : trOdd) }}>
                       <span className="px-2 text-[10px] truncate" title={id}
                             style={{ color: isObj ? S.primary : S.secondary, fontWeight: isObj ? 700 : 400 }}>
                         {id}
